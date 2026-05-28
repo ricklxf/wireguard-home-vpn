@@ -1,0 +1,7 @@
+# 生成的密钥和客户端配置——绝对不要提交到 Git
+*.key
+clients/
+*.conf
+
+# macOS
+.DS_Store
