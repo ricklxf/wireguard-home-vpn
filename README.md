@@ -159,6 +159,39 @@ pfctl 通过连接状态表自动完成回包还原，无需手动干预。
 
 ---
 
+## 服务管理
+
+### 停止服务
+
+```bash
+# 临时关闭（重启 Mac 后自动恢复）
+sudo wg-quick down wg0
+
+# 彻底关闭（取消开机自启 + 停止服务）
+sudo wg-quick down wg0
+sudo launchctl unload -w /Library/LaunchDaemons/com.wireguard.wg0.plist
+```
+
+### 启动服务
+
+```bash
+# 立即启动
+sudo wg-quick up wg0
+
+# 重新注册开机自启（彻底关闭后恢复用）
+sudo launchctl load -w /Library/LaunchDaemons/com.wireguard.wg0.plist
+```
+
+### 确认当前状态
+
+```bash
+sudo wg show
+# 有输出 → 运行中
+# 提示 "Unable to access interface" → 已停止
+```
+
+---
+
 ## 常用命令
 
 ```bash
@@ -171,9 +204,6 @@ sudo wg-quick down wg0 && sudo wg-quick up wg0
 # 查看日志
 tail -f /var/log/wireguard-wg0.log
 tail -f /var/log/wireguard-wg0.err
-
-# 手动停止（不影响开机自启配置）
-sudo wg-quick down wg0
 
 # 查看 pfctl NAT 规则是否生效
 sudo pfctl -a wireguard -s nat
