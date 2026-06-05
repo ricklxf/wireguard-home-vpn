@@ -34,9 +34,14 @@ SERVER_VPN_IP="10.13.13.1"
 mkdir -p "$WG_DIR"
 chmod 700 "$WG_DIR"
 
-# 检测出口网络接口（连接互联网的那个）
-WAN_IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
-[[ -z "$WAN_IFACE" ]] && err "无法自动检测网络接口，请检查网络连接"
+# 检测物理出口网络接口（排除 VPN/虚拟接口，如 Surge 的 utun）
+WAN_IFACE=$(networksetup -listallhardwareports 2>/dev/null \
+    | awk '/Device:/{print $2}' \
+    | while read -r dev; do
+        ip=$(ipconfig getifaddr "$dev" 2>/dev/null)
+        [[ -n "$ip" ]] && echo "$dev" && break
+      done)
+[[ -z "$WAN_IFACE" ]] && err "无法自动检测物理网络接口，请检查网络连接"
 log "出口网络接口: $WAN_IFACE"
 
 # ── 生成服务端密钥 ─────────────────────────────────────────────────────────
@@ -61,22 +66,15 @@ if ! grep -q 'wireguard' "$PF_CONF" 2>/dev/null; then
 fi
 
 # ── 生成 wg0.conf ──────────────────────────────────────────────────────────
+# 注意：wg0.conf 中 PostUp/PostDown 必须是单行，不支持 \ 换行
 log "生成 ${WG_DIR}/wg0.conf..."
 cat > "$WG_DIR/wg0.conf" <<EOF
 [Interface]
 PrivateKey = ${SERVER_PRIVATE}
 Address    = ${SERVER_VPN_IP}/24
 ListenPort = ${WG_PORT}
-
-# PostUp：开启 IP 转发 + NAT
-PostUp   = sysctl -w net.inet.ip.forwarding=1; \\
-           echo 'nat on ${WAN_IFACE} from ${VPN_SUBNET}/24 to any -> (${WAN_IFACE})' \\
-           | pfctl -a wireguard -f - 2>/dev/null; \\
-           pfctl -e 2>/dev/null || true
-
-# PostDown：清除 NAT 规则，关闭 IP 转发
-PostDown = pfctl -a wireguard -F all 2>/dev/null || true; \\
-           sysctl -w net.inet.ip.forwarding=0 2>/dev/null || true
+PostUp     = sysctl -w net.inet.ip.forwarding=1; echo 'nat on ${WAN_IFACE} from ${VPN_SUBNET}/24 to any -> (${WAN_IFACE})' | pfctl -a wireguard -f - 2>/dev/null; pfctl -e 2>/dev/null || true
+PostDown   = pfctl -a wireguard -F all 2>/dev/null || true; sysctl -w net.inet.ip.forwarding=0 2>/dev/null || true
 EOF
 chmod 600 "$WG_DIR/wg0.conf"
 
