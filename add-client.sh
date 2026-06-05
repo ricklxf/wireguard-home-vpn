@@ -61,6 +61,8 @@ cat > "$CONFIG_FILE" <<EOF
 PrivateKey = ${CLIENT_PRIVATE}
 Address    = ${CLIENT_IP}/24
 DNS        = 8.8.8.8, 8.8.4.4
+# MTU 设为 1280 避免大包被丢弃（WireGuard 封装有额外开销）
+MTU        = 1280
 
 [Peer]
 PublicKey           = ${SERVER_PUBLIC}

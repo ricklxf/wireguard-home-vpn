@@ -38,28 +38,38 @@ sudo bash setup-server.sh
 
 1. 安装 `wireguard-tools`（通过 Homebrew）
 2. 生成服务端 Curve25519 密钥对，存储在 `$(brew --prefix)/etc/wireguard/`
-3. 生成 `wg0.conf`，写入 PostUp/PostDown 钩子管理 pfctl NAT 规则
-4. 向 `/etc/pf.conf` 注册 `wireguard` anchor（首次运行自动备份原文件）
-5. 在 `/Library/LaunchDaemons/` 注册服务，开机自动启动
+3. 自动检测物理出口网卡（排除 Surge 等软件产生的虚拟 utun 接口）
+4. 生成 `wg0.conf`，PostUp/PostDown 为单行命令（wg-quick 不支持 `\` 换行）
+5. 向 `/etc/pf.conf` 注册 `wireguard` anchor（首次运行自动备份原文件）
+6. 在 `/Library/LaunchDaemons/` 注册服务，开机自动启动
 
 ### 第二步：在家用路由器上配置端口映射
 
 将 **UDP 51820** 端口转发到家里 Mac 的内网 IP。
 
-> 具体操作因路由器品牌而异，通常在「虚拟服务器」或「端口映射」菜单下设置。
+> 具体操作因路由器品牌而异，通常在「虚拟服务器」或「端口映射」菜单下设置。  
 > Mac 内网 IP 在系统设置 → 网络 里查看，或运行 `ipconfig getifaddr en0`。
+
+端口映射字段说明：
+
+| 字段 | 值 |
+|------|----|
+| 协议 | UDP |
+| 外部端口 | 51820 |
+| 内部 IP | Mac 的内网 IP |
+| 内部端口 | 51820 |
 
 ### 第三步：生成公司电脑的客户端配置
 
 ```bash
-sudo bash add-client.sh work-macbook <家里的公网IP>
+sudo bash add-client.sh work-macbook <家里的公网IP或域名>
 ```
 
 脚本自动完成：
 
 1. 生成客户端密钥对
 2. 分配 VPN 子网 IP（`10.13.13.x`，自动递增）
-3. 生成 `clients/work-macbook/work-macbook.conf`
+3. 生成 `clients/work-macbook/work-macbook.conf`（含 `MTU = 1280`，避免大包被丢弃）
 4. 热更新运行中的 WireGuard（无需重启）
 5. 若已安装 `qrencode`，打印二维码供手机扫码导入
 
@@ -83,8 +93,11 @@ sudo bash add-client.sh work-macbook <家里的公网IP>
 # 出口 IP 应该显示家里的公网 IP
 curl https://ifconfig.me
 
-# 可以 ping 到服务端的 VPN IP
+# ping VPN 网关
 ping 10.13.13.1
+
+# ping 外网（验证转发和 NAT）
+ping 8.8.8.8
 ```
 
 在服务端查看连接状态：
@@ -124,16 +137,22 @@ sysctl -w net.inet.ip.forwarding=1
 ### pfctl NAT
 
 公司电脑的 VPN IP（`10.13.13.x`）是私有地址，互联网不认识。  
-NAT 规则将出包的源地址替换为 Mac 自己的公网/内网 IP：
+NAT 规则将出包的源地址替换为 Mac 自己的 IP：
 
 ```
 原始包：src=10.13.13.2  dst=8.8.8.8
-经 NAT：src=192.168.1.5  dst=8.8.8.8   ← 互联网看到的
-回包：  src=8.8.8.8     dst=192.168.1.5
+经 NAT：src=192.168.1.4  dst=8.8.8.8   ← 互联网看到的
+回包：  src=8.8.8.8     dst=192.168.1.4
 还原：  src=8.8.8.8     dst=10.13.13.2 ← 送回给公司电脑
 ```
 
 pfctl 通过连接状态表自动完成回包还原，无需手动干预。
+
+### MTU
+
+WireGuard 封装会增加约 60 字节的头部开销。  
+客户端配置默认设置 `MTU = 1280`（保守值），避免大包超出物理网卡 MTU（1500）被丢弃。  
+ICMP ping 包小，不受影响；TCP/HTTPS 的大包如不设置 MTU 容易出现"能 ping 通但无法浏览网页"的现象。
 
 ### LaunchDaemon（开机自启）
 
@@ -144,18 +163,43 @@ pfctl 通过连接状态表自动完成回包还原，无需手动干预。
 
 ## 与 Surge 的兼容性
 
-如果家里 Mac 同时运行了 Surge，行为如下：
+如果家里 Mac 同时运行了 Surge，需要额外配置，否则 WireGuard 响应包会被 Surge 劫持。
 
-| Surge 模式 | 公司电脑流量是否经过 Surge |
-|-----------|--------------------------|
-| 仅系统代理（System Proxy） | ❌ 不经过。系统代理工作在应用层，感知不到内核转发的包 |
-| 增强模式（Enhanced Mode） | ✅ 经过。Surge 的 TUN 接管路由表，转发包会命中分流规则 |
-| 两者同时开启 | ✅ 同增强模式，Enhanced Mode 覆盖，分流规则生效 |
+### 问题原因
 
-开启增强模式后，公司电脑的流量会按照 Surge 的规则分流，  
-行为与家里 Mac 本机应用完全一致。
+Surge Enhanced Mode（增强模式）会接管系统路由表，所有出站流量都经过 Surge 的虚拟接口。  
+WireGuard 向公司电脑发回包时，包被 Surge 拦截，**源地址被替换为 Surge 的虚拟 IP（`198.18.0.1`）**，  
+公司电脑收到后认不出这个地址，握手失败。
 
-**验证方式**：连上 VPN 后，在 Surge 的「请求记录」里查看是否出现公司电脑发出的请求。
+> `PROCESS-NAME,wireguard-go,DIRECT` 规则对 UDP 无效——Surge 处理 UDP 时无论规则是否 DIRECT，仍使用虚拟 IP 转发。
+
+### 解决方案
+
+在 Surge 配置文件的 `[General]` 中，将公司电脑所在的 IP 段加入 `tun-excluded-routes`：
+
+```ini
+[General]
+tun-excluded-routes = 117.133.0.0/16
+```
+
+这条配置让 Surge 对目标为该 IP 段的流量不走 TUN，WireGuard 的响应包直接从物理网卡（`en0`）发出，源地址正常。
+
+加载配置后在 Mac 上用 tcpdump 验证：
+
+```bash
+sudo tcpdump -ni en0 udp port 51820
+# 回包源地址应为 192.168.1.x，而非 198.18.0.1
+```
+
+### 各模式行为汇总
+
+| Surge 模式 | 不做额外配置 | 加 tun-excluded-routes |
+|-----------|------------|----------------------|
+| 仅系统代理 | ✅ 正常工作 | 不需要 |
+| 增强模式 | ❌ 回包源 IP 错误，握手失败 | ✅ 正常工作 |
+| 两者同时开启 | ❌ 同增强模式 | ✅ 正常工作 |
+
+> **注意**：`tun-excluded-routes` 是按目标 IP 排除，如果公司 IP 段变化需要手动更新。
 
 ---
 
@@ -207,7 +251,59 @@ tail -f /var/log/wireguard-wg0.err
 
 # 查看 pfctl NAT 规则是否生效
 sudo pfctl -a wireguard -s nat
+
+# 抓包调试（看 51820 端口流量）
+sudo tcpdump -ni en0 udp port 51820
 ```
+
+---
+
+## 故障排查
+
+### 握手一直失败（Handshake did not complete）
+
+按顺序检查：
+
+1. **服务端是否在运行**：`sudo wg show`，有输出说明在运行
+2. **路由器端口映射是否配置**：确认 UDP 51820 已转发到 Mac 内网 IP
+3. **DNS 是否指向正确 IP**：`curl ifconfig.me` 查看当前公网 IP，与域名解析结果对比
+4. **抓包确认流量是否到达**：`sudo tcpdump -ni any udp port 51820`，让客户端重连，看有无输出
+
+### 能 ping 通但网页打不开
+
+典型的 MTU 问题。ping 的包小（32 字节），TCP/HTTPS 的大包超出 WireGuard 封装后的有效 MTU。
+
+在客户端配置 `[Interface]` 中添加：
+
+```ini
+MTU = 1280
+```
+
+### Surge 开启增强模式时握手失败
+
+WireGuard 回包源 IP 被 Surge 替换为 `198.18.0.1`，客户端拒绝。
+
+在 Surge 配置的 `[General]` 中加入：
+
+```ini
+tun-excluded-routes = <公司电脑IP段，如 117.133.0.0/16>
+```
+
+### Windows 关闭 VPN 后 Mac 仍收到流量
+
+正常现象。Windows WireGuard 服务（`WireGuardTunnel$work-macbook`）在"Deactivate"后可能仍在后台运行，`PersistentKeepalive = 25` 会每 25 秒发一个保活包。  
+此外端口 51820 暴露在公网，互联网扫描器也会随机探测。  
+WireGuard 会验证密钥，无效包直接丢弃，不影响安全。
+
+### wg-quick 启动报 `Line unrecognized`
+
+`wg0.conf` 中 PostUp/PostDown 使用了 `\` 换行，wg-quick 不支持多行。  
+需将命令改为单行。参考 `setup-server.sh` 生成的格式。
+
+### 接口检测到 Surge 的 utun 而非物理网卡
+
+`route -n get default` 在 Surge Enhanced Mode 开启时返回 Surge 的虚拟接口。  
+`setup-server.sh` 已改用 `networksetup -listallhardwareports` + `ipconfig getifaddr` 检测物理网卡，避免此问题。
 
 ---
 
