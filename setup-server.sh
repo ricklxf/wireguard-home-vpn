@@ -62,7 +62,8 @@ if ! grep -q 'wireguard' "$PF_CONF" 2>/dev/null; then
     log "备份并更新 /etc/pf.conf..."
     cp "$PF_CONF" "${PF_CONF}.bak.wireguard"
     # 在 nat-anchor "com.apple/*" 后插入 wireguard anchor
-    sed -i '' 's|nat-anchor "com\.apple/\*"|nat-anchor "com.apple/*"\nnat-anchor "wireguard"|' "$PF_CONF"
+    sed -i '' 's|nat-anchor "com\.apple/\*"|nat-anchor "com.apple/*"\
+nat-anchor "wireguard"|' "$PF_CONF"
 fi
 
 # ── 生成 wg0.conf ──────────────────────────────────────────────────────────

@@ -305,6 +305,33 @@ WireGuard 会验证密钥，无效包直接丢弃，不影响安全。
 `route -n get default` 在 Surge Enhanced Mode 开启时返回 Surge 的虚拟接口。  
 `setup-server.sh` 已改用 `networksetup -listallhardwareports` + `ipconfig getifaddr` 检测物理网卡，避免此问题。
 
+### 重启后无法访问局域网内其他设备（VPN 内网互通失败）
+
+**现象**：WireGuard 隧道正常（`ping 10.13.13.1` 通），但无法访问服务端同一局域网内的其他设备（如 `192.168.1.x`），重启前一切正常。
+
+**原因**：macOS BSD `sed` 在替换字符串中不把 `\n` 解析为换行符，导致 `setup-server.sh` 未能将 `nat-anchor "wireguard"` 写入 `/etc/pf.conf`。重启前 pf 的内存状态恰好生效；重启后 macOS 用 `/etc/pf.conf` 重新初始化 pf，anchor 引用缺失，NAT 不再生效，来自客户端的包源地址未被替换，目标设备的回包走默认网关后丢失。
+
+**验证**：
+
+```bash
+# 如果输出为空，说明 anchor 引用缺失
+grep 'wireguard' /etc/pf.conf
+```
+
+**修复**：
+
+```bash
+sudo cp /etc/pf.conf /etc/pf.conf.bak
+sudo sed -i '' 's|nat-anchor "com\.apple/\*"|nat-anchor "com.apple/*"\
+nat-anchor "wireguard"|' /etc/pf.conf
+
+# 重载规则集并重新写入 anchor 规则
+sudo pfctl -f /etc/pf.conf
+echo 'nat on en0 inet from 10.13.13.0/24 to any -> (en0)' | sudo pfctl -a wireguard -f -
+```
+
+`setup-server.sh` 已修复此 bug，重新运行脚本可一次性修复。
+
 ---
 
 ## 安全说明
