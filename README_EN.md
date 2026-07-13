@@ -250,19 +250,24 @@ if "!WG_IF!"=="" (
     goto wait
 )
 
-route add 0.0.0.0 mask 0.0.0.0 10.13.13.1 metric 1 IF !WG_IF!
-route add <company subnet> mask <netmask> <company local gateway> metric 1
+route delete 0.0.0.0 mask 0.0.0.0 10.13.13.1 >nul 2>&1
+route add 0.0.0.0 mask 0.0.0.0 10.13.13.1 metric 1 IF !WG_IF! -p
+route add <company subnet> mask <netmask> <company local gateway> metric 1 -p
 ```
 
 The first line is "route everything through the tunnel by default"; subsequent lines are "precise exceptions that stay local." Windows routing uses longest-prefix-match first, so a precise subnet route always wins over `0.0.0.0/0` regardless of the order they're added in.
 
-### Three key gotchas
+Every route is marked `-p` (persistent) so it survives sleep/wake cycles or brief network drops without being silently cleared by the OS. The default route is deleted (errors ignored) right before being re-added, so a stale persistent entry left over from a previous boot — potentially bound to a now-invalid interface index — can't block the fresh one from being added.
+
+### Four key gotchas
 
 1. **`route add` may bind to the wrong interface if you don't specify one explicitly**: the gateway is correct (`10.13.13.1`), but Windows's automatic guess at "which NIC can reach this gateway" sometimes incorrectly picks the physical NIC instead of the WireGuard tunnel interface, silently making the route useless. You must specify `IF <interface index>` explicitly. Get the index from `route print -4` (look for "WireGuard Tunnel" in the `Interface List`) — it can change across reboots, so query it dynamically in scripts rather than hardcoding it.
 
 2. **`PostUp`/`PostDown` may not execute at all on the Windows client**: some versions of the official GUI client silently skip the `PostUp`/`PostDown` scripts in the config file (with no trace in the logs either). Don't assume it works — always verify with `route print`. If it doesn't fire, fall back to a manual batch script, or register a Windows Scheduled Task triggered at boot/connect.
 
 3. **Batch command separator**: Windows `cmd.exe` chains multiple commands with `&`, not the Unix-style `;` (which can be treated as a comment marker in some contexts, silently dropping the rest of the line).
+
+4. **Routes without `-p` can vanish with no reboot involved**: laptop sleep/wake or a brief Wi-Fi drop-and-reconnect can trigger Windows to clear non-persistent routes — the symptom is "the machine never restarted, but VPN-side LAN access just stopped working." `route print -4` will confirm the route is simply gone. The fix is to mark routes `-p`; but if a route also hardcodes `IF <interface index>`, a persisted entry can become stale or misbound after an actual reboot changes that index, so the boot script should `route delete` first as a safety net before re-adding.
 
 ### Running the routing script automatically at boot
 
