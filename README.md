@@ -1,3 +1,5 @@
+🇨🇳 **CN** | [🇺🇸 EN](README_EN.md)
+
 # WireGuard Home VPN
 
 让公司电脑的所有流量经由家里的 macOS 出网。
@@ -200,6 +202,105 @@ sudo tcpdump -ni en0 udp port 51820
 | 两者同时开启 | ❌ 同增强模式 | ✅ 正常工作 |
 
 > **注意**：`tun-excluded-routes` 是按目标 IP 排除，如果公司 IP 段变化需要手动更新。
+
+---
+
+## Windows 客户端分流方案（内网走公司，外网走家里）
+
+需求：公司电脑连 VPN 后，访问公司内网（打印机、内网系统）走公司本地网络，其余流量（含被墙网站）经家里出网。
+
+### 为什么不能靠 AllowedIPs 排除网段
+
+直觉做法是把公司内网段从 `AllowedIPs` 里排除（用互补 CIDR 列表覆盖除公司网段外的所有地址）。实测在 Windows 上会失败：
+
+- **官方 WireGuard Windows 客户端内置防泄漏保护**：当 `AllowedIPs` 约等于覆盖全部 IPv4 地址空间时（无论写一条 `0.0.0.0/0` 还是拆成几十条碎片 CIDR），客户端会在标准路由表之外，用 Windows Filtering Platform 再加一层拦截，专门屏蔽"绕过隧道"的流量——这是它的安全特性，不是 bug，但会连带误伤自己所在网段的正常通信。
+- 现象：`route print` 显示的路由表完全正确（公司网段走物理网卡的 on-link 路由），但 `ping`/`tracert` 到同网段设备依然 `General failure`。断开 VPN 立即恢复，`netsh int ip reset` + 重启也无效——说明问题不在路由表或系统状态，而在客户端自身的过滤逻辑。
+
+### 正确方案：Table = off + 手动路由
+
+让 WireGuard 客户端完全不接管路由表，绕开它内置的防泄漏逻辑，改用标准 Windows 路由手动控制：
+
+```ini
+[Interface]
+PrivateKey = <客户端私钥>
+Address    = 10.13.13.2/24
+DNS        = 8.8.8.8, 8.8.4.4
+Table      = off
+
+[Peer]
+PublicKey  = <服务端公钥>
+Endpoint   = <家里公网IP或域名>:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+```
+
+`AllowedIPs` 保持 `0.0.0.0/0`（这只影响加密路由判断，不再驱动系统路由表），`Table = off` 让路由表完全交给我们手动管理。
+
+### 手动路由脚本（管理员权限运行）
+
+```batch
+@echo off
+setlocal enabledelayedexpansion
+
+:wait
+set WG_IF=
+for /f "tokens=1" %%i in ('netsh interface ipv4 show interfaces ^| findstr /C:"WireGuard Tunnel"') do set WG_IF=%%i
+if "!WG_IF!"=="" (
+    timeout /t 2 >nul
+    goto wait
+)
+
+route add 0.0.0.0 mask 0.0.0.0 10.13.13.1 metric 1 IF !WG_IF!
+route add <公司内网段> mask <掩码> <公司本地网关> metric 1
+```
+
+第一条是"默认全走隧道"，第二条起是"精确排除走本地"——Windows 路由按最长前缀匹配优先，精确网段路由永远赢过 `0.0.0.0/0`，不需要考虑添加顺序。
+
+### 三个关键坑
+
+1. **`route add` 不指定接口时可能绑错网卡**：网关写对了（`10.13.13.1`），但 Windows 自动判断"哪张网卡能到达这个网关"时，有时会错误地绑定到物理网卡而非 WireGuard 隧道网卡，导致路由形同虚设。必须用 `IF <接口编号>` 显式指定，编号通过 `route print -4`（查看 `Interface List` 里 "WireGuard Tunnel" 对应的编号）获取，每次重启可能变化，脚本里建议动态查询而非写死。
+
+2. **`PostUp`/`PostDown` 在 Windows 客户端上可能完全不执行**：部分版本的官方 GUI 客户端不会运行配置文件里的 `PostUp`/`PostDown` 脚本（日志里也不会有任何相关记录），不要假设它一定生效，务必用 `route print` 实测验证。不生效时改用手动批处理脚本，或注册 Windows 计划任务在开机/连接后触发。
+
+3. **批处理多命令分隔符**：Windows `cmd.exe` 用 `&` 连接多条命令，不是 Unix 风格的 `;`（`;` 在部分场景会被当成注释符处理，导致整行被忽略）。
+
+### 开机自动运行路由脚本
+
+前提：WireGuard 隧道本身已设置开机自动连接。
+
+将上面的路由脚本保存为 `C:\Scripts\wg-routes.bat`，管理员 PowerShell 执行一次（仅需一次）：
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "C:\Scripts\wg-routes.bat"
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "WireGuard-Routes" -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+```
+
+以 `SYSTEM` 权限开机自动触发，不弹 UAC 确认。脚本内置等待循环，会轮询直到 WireGuard 隧道接口就绪再添加路由，避免开机瞬间隧道未建立导致失败。
+
+### 公司内网专属网站访问不了（403 / 假 IP）
+
+现象：公司某些系统只允许内网 IP 访问，连 VPN 后打开报 403 或直接打不开。
+
+原因：DNS 查询也会经隧道到家里，如果家里 Mac 跑了 Surge 增强模式，DNS 会被拦截返回 Surge 的虚拟 IP（`198.18.0.0/15` 段），公司服务器不认这个假 IP。
+
+排查：
+
+```cmd
+nslookup <域名>
+```
+
+对比连 VPN 前后解析结果是否一致，若连 VPN 后解析出 `198.18.x.x` 就是这个原因。
+
+解决：不依赖 DNS，直接在 Windows hosts 文件里写死真实 IP（管理员 CMD）：
+
+```cmd
+echo <真实IP> <域名> >> C:\Windows\System32\drivers\etc\hosts
+```
+
+同时把该 IP 所在网段加入上面的"手动路由"脚本，确保这个 IP 走本地网络而非隧道。
 
 ---
 
