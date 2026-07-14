@@ -244,7 +244,7 @@ setlocal enabledelayedexpansion
 
 :wait
 set WG_IF=
-for /f "tokens=1" %%i in ('netsh interface ipv4 show interfaces ^| findstr /C:"WireGuard Tunnel"') do set WG_IF=%%i
+for /f "tokens=1" %%i in ('netsh interface ipv4 show interfaces ^| findstr /C:"<客户端名称，如 work-macbook>"') do set WG_IF=%%i
 if "!WG_IF!"=="" (
     timeout /t 2 >nul
     goto wait
@@ -259,7 +259,7 @@ route add <公司内网段> mask <掩码> <公司本地网关> metric 1 -p
 
 所有路由都加 `-p`（持久化）防止睡眠/唤醒或短暂断网后被系统清掉；默认路由这条在加之前先 `route delete`（忽略报错）清一次，避免重启后接口编号变化导致旧的持久化记录卡在错误接口上、阻塞新路由写入。
 
-### 四个关键坑
+### 五个关键坑
 
 1. **`route add` 不指定接口时可能绑错网卡**：网关写对了（`10.13.13.1`），但 Windows 自动判断"哪张网卡能到达这个网关"时，有时会错误地绑定到物理网卡而非 WireGuard 隧道网卡，导致路由形同虚设。必须用 `IF <接口编号>` 显式指定，编号通过 `route print -4`（查看 `Interface List` 里 "WireGuard Tunnel" 对应的编号）获取，每次重启可能变化，脚本里建议动态查询而非写死。
 
@@ -268,6 +268,8 @@ route add <公司内网段> mask <掩码> <公司本地网关> metric 1 -p
 3. **批处理多命令分隔符**：Windows `cmd.exe` 用 `&` 连接多条命令，不是 Unix 风格的 `;`（`;` 在部分场景会被当成注释符处理，导致整行被忽略）。
 
 4. **不带 `-p` 的路由会在没有重启的情况下消失**：笔记本睡眠/唤醒、WiFi 短暂断开重连都可能触发系统清理非持久化路由，症状是"机器没重启，VPN 内网访问突然又不通了"。用 `route print -4` 能看到该路由确实不见了。解决办法是给路由都加 `-p`；但如果同时用了 `IF <接口编号>` 硬编码接口，持久化记录在真正重启后可能因为接口编号变化而失效或错位，所以开机脚本里要在添加前先 `route delete` 清一次兜底。
+
+5. **接口"别名"和"描述"不是一回事，脚本按名字查询接口时容易查错**：`route print -4` 的 `Interface List` 里显示的是驱动描述（通常固定为 "WireGuard Tunnel"），而 `netsh interface ipv4 show interfaces` 显示的是接口**别名**，别名等于导入配置时的隧道/客户端名称（如 `work-macbook`），不是 "WireGuard Tunnel"。用 `netsh` 查询时如果按描述文本去匹配，会永远匹配不到——脚本里的等待循环会卡死不退出（计划任务查询会显示 `Status: Running` 且 `Last Result: 267009` 长期不变）。脚本里 `findstr` 要匹配的是**客户端名称**，不是 "WireGuard Tunnel"。
 
 ### 开机自动运行路由脚本
 

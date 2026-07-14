@@ -244,7 +244,7 @@ setlocal enabledelayedexpansion
 
 :wait
 set WG_IF=
-for /f "tokens=1" %%i in ('netsh interface ipv4 show interfaces ^| findstr /C:"WireGuard Tunnel"') do set WG_IF=%%i
+for /f "tokens=1" %%i in ('netsh interface ipv4 show interfaces ^| findstr /C:"<client name, e.g. work-macbook>"') do set WG_IF=%%i
 if "!WG_IF!"=="" (
     timeout /t 2 >nul
     goto wait
@@ -259,7 +259,7 @@ The first line is "route everything through the tunnel by default"; subsequent l
 
 Every route is marked `-p` (persistent) so it survives sleep/wake cycles or brief network drops without being silently cleared by the OS. The default route is deleted (errors ignored) right before being re-added, so a stale persistent entry left over from a previous boot — potentially bound to a now-invalid interface index — can't block the fresh one from being added.
 
-### Four key gotchas
+### Five key gotchas
 
 1. **`route add` may bind to the wrong interface if you don't specify one explicitly**: the gateway is correct (`10.13.13.1`), but Windows's automatic guess at "which NIC can reach this gateway" sometimes incorrectly picks the physical NIC instead of the WireGuard tunnel interface, silently making the route useless. You must specify `IF <interface index>` explicitly. Get the index from `route print -4` (look for "WireGuard Tunnel" in the `Interface List`) — it can change across reboots, so query it dynamically in scripts rather than hardcoding it.
 
@@ -268,6 +268,8 @@ Every route is marked `-p` (persistent) so it survives sleep/wake cycles or brie
 3. **Batch command separator**: Windows `cmd.exe` chains multiple commands with `&`, not the Unix-style `;` (which can be treated as a comment marker in some contexts, silently dropping the rest of the line).
 
 4. **Routes without `-p` can vanish with no reboot involved**: laptop sleep/wake or a brief Wi-Fi drop-and-reconnect can trigger Windows to clear non-persistent routes — the symptom is "the machine never restarted, but VPN-side LAN access just stopped working." `route print -4` will confirm the route is simply gone. The fix is to mark routes `-p`; but if a route also hardcodes `IF <interface index>`, a persisted entry can become stale or misbound after an actual reboot changes that index, so the boot script should `route delete` first as a safety net before re-adding.
+
+5. **Interface "alias" and "description" are not the same thing, and scripts that match by name easily query the wrong one**: `route print -4`'s `Interface List` shows the driver *description* (usually literally "WireGuard Tunnel"), while `netsh interface ipv4 show interfaces` shows the interface's **alias**, which equals the tunnel/client name given at import time (e.g. `work-macbook`), not "WireGuard Tunnel". If a script queries via `netsh` but matches against the description text, it will never find a match — the wait loop hangs forever (a scheduled task query will show `Status: Running` with `Last Result: 267009` stuck indefinitely). The `findstr` pattern in the script must match the **client name**, not "WireGuard Tunnel".
 
 ### Running the routing script automatically at boot
 
