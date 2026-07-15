@@ -242,10 +242,13 @@ PersistentKeepalive = 25
 @echo off
 setlocal enabledelayedexpansion
 
+set RETRY=0
 :wait
 set WG_IF=
 for /f "tokens=1" %%i in ('netsh interface ipv4 show interfaces ^| findstr /C:"<客户端名称，如 work-macbook>"') do set WG_IF=%%i
 if "!WG_IF!"=="" (
+    set /a RETRY+=1
+    if !RETRY! GEQ 30 exit /b
     timeout /t 2 >nul
     goto wait
 )
@@ -255,11 +258,13 @@ route add 0.0.0.0 mask 0.0.0.0 10.13.13.1 metric 1 IF !WG_IF! -p
 route add <公司内网段> mask <掩码> <公司本地网关> metric 1 -p
 ```
 
+等待循环最多重试 30 次（约 60 秒），超时直接退出，不再无限等待——原因见下面第 6 个坑。
+
 第一条是"默认全走隧道"，第二条起是"精确排除走本地"——Windows 路由按最长前缀匹配优先，精确网段路由永远赢过 `0.0.0.0/0`，不需要考虑添加顺序。
 
 所有路由都加 `-p`（持久化）防止睡眠/唤醒或短暂断网后被系统清掉；默认路由这条在加之前先 `route delete`（忽略报错）清一次，避免重启后接口编号变化导致旧的持久化记录卡在错误接口上、阻塞新路由写入。
 
-### 五个关键坑
+### 六个关键坑
 
 1. **`route add` 不指定接口时可能绑错网卡**：网关写对了（`10.13.13.1`），但 Windows 自动判断"哪张网卡能到达这个网关"时，有时会错误地绑定到物理网卡而非 WireGuard 隧道网卡，导致路由形同虚设。必须用 `IF <接口编号>` 显式指定，编号通过 `route print -4`（查看 `Interface List` 里 "WireGuard Tunnel" 对应的编号）获取，每次重启可能变化，脚本里建议动态查询而非写死。
 
@@ -271,7 +276,9 @@ route add <公司内网段> mask <掩码> <公司本地网关> metric 1 -p
 
 5. **接口"别名"和"描述"不是一回事，脚本按名字查询接口时容易查错**：`route print -4` 的 `Interface List` 里显示的是驱动描述（通常固定为 "WireGuard Tunnel"），而 `netsh interface ipv4 show interfaces` 显示的是接口**别名**，别名等于导入配置时的隧道/客户端名称（如 `work-macbook`），不是 "WireGuard Tunnel"。用 `netsh` 查询时如果按描述文本去匹配，会永远匹配不到——脚本里的等待循环会卡死不退出（计划任务查询会显示 `Status: Running` 且 `Last Result: 267009` 长期不变）。脚本里 `findstr` 要匹配的是**客户端名称**，不是 "WireGuard Tunnel"。
 
-### 开机自动运行路由脚本
+6. **手动断开重连 WireGuard 后路由会再次失效，`-p` 也救不了**：`-p` 持久化解决的是"网卡还在、路由被系统清空"的场景（睡眠/唤醒、短暂断网）；但手动 Deactivate 再 Activate 时，WireGuard 的虚拟网卡是被整个销毁重建的，绑定在旧网卡对象上的路由随之失效，跟持久化与否无关。只在开机时触发一次的计划任务覆盖不到这种情况，必须换成网络状态变化事件触发（见下）。同时等待循环不能写成无限等待：事件触发可能因为纯 WiFi 抖动而不涉及 WireGuard，若循环无限等下去，配合任务的 `IgnoreNew`（防止并发）设置会导致任务一直卡在"运行中"，后续 WireGuard 真正重连时的触发事件被直接丢弃——所以脚本必须有超时退出。
+
+### 让路由脚本在开机和 WireGuard 重连时都自动运行
 
 前提：WireGuard 隧道本身已设置开机自动连接。
 
@@ -279,13 +286,22 @@ route add <公司内网段> mask <掩码> <公司本地网关> metric 1 -p
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "C:\Scripts\wg-routes.bat"
-$trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger1 = New-ScheduledTaskTrigger -AtStartup
+
+$class = Get-CimClass MSFT_TaskEventTrigger root/Microsoft/Windows/TaskScheduler
+$trigger2 = New-CimInstance -CimClass $class -ClientOnly
+$trigger2.Subscription = @'
+<QueryList><Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"><Select Path="Microsoft-Windows-NetworkProfile/Operational">*[System[(EventID=10000 or EventID=10001)]]</Select></Query></QueryList>
+'@
+$trigger2.Enabled = $true
+
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "WireGuard-Routes" -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+
+Register-ScheduledTask -TaskName "WireGuard-Routes" -Action $action -Trigger @($trigger1,$trigger2) -Principal $principal -Settings $settings -Force
 ```
 
-以 `SYSTEM` 权限开机自动触发，不弹 UAC 确认。脚本内置等待循环，会轮询直到 WireGuard 隧道接口就绪再添加路由，避免开机瞬间隧道未建立导致失败。
+以 `SYSTEM` 权限触发，不弹 UAC 确认。`EventID 10000/10001`（网络已连接/已断开）在任意网卡状态变化时都会触发一次，包括 WireGuard 断开重连；脚本本身是幂等的（默认路由先删再加，其余路由带 `-p` 已存在也不报错），触发得比实际需要更频繁也无害。`IgnoreNew` 防止事件密集触发时脚本并发跑，前提是脚本自身有超时退出（见上面第 6 个坑），否则一次卡死的等待会挡住后续所有触发。
 
 ### 公司内网专属网站访问不了（403 / 假 IP）
 

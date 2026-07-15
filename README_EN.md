@@ -242,10 +242,13 @@ Keep `AllowedIPs` at `0.0.0.0/0` (it now only affects cryptokey routing, not the
 @echo off
 setlocal enabledelayedexpansion
 
+set RETRY=0
 :wait
 set WG_IF=
 for /f "tokens=1" %%i in ('netsh interface ipv4 show interfaces ^| findstr /C:"<client name, e.g. work-macbook>"') do set WG_IF=%%i
 if "!WG_IF!"=="" (
+    set /a RETRY+=1
+    if !RETRY! GEQ 30 exit /b
     timeout /t 2 >nul
     goto wait
 )
@@ -255,11 +258,13 @@ route add 0.0.0.0 mask 0.0.0.0 10.13.13.1 metric 1 IF !WG_IF! -p
 route add <company subnet> mask <netmask> <company local gateway> metric 1 -p
 ```
 
+The wait loop retries at most 30 times (~60 seconds) and then exits instead of waiting forever — see gotcha #6 below for why.
+
 The first line is "route everything through the tunnel by default"; subsequent lines are "precise exceptions that stay local." Windows routing uses longest-prefix-match first, so a precise subnet route always wins over `0.0.0.0/0` regardless of the order they're added in.
 
 Every route is marked `-p` (persistent) so it survives sleep/wake cycles or brief network drops without being silently cleared by the OS. The default route is deleted (errors ignored) right before being re-added, so a stale persistent entry left over from a previous boot — potentially bound to a now-invalid interface index — can't block the fresh one from being added.
 
-### Five key gotchas
+### Six key gotchas
 
 1. **`route add` may bind to the wrong interface if you don't specify one explicitly**: the gateway is correct (`10.13.13.1`), but Windows's automatic guess at "which NIC can reach this gateway" sometimes incorrectly picks the physical NIC instead of the WireGuard tunnel interface, silently making the route useless. You must specify `IF <interface index>` explicitly. Get the index from `route print -4` (look for "WireGuard Tunnel" in the `Interface List`) — it can change across reboots, so query it dynamically in scripts rather than hardcoding it.
 
@@ -271,7 +276,9 @@ Every route is marked `-p` (persistent) so it survives sleep/wake cycles or brie
 
 5. **Interface "alias" and "description" are not the same thing, and scripts that match by name easily query the wrong one**: `route print -4`'s `Interface List` shows the driver *description* (usually literally "WireGuard Tunnel"), while `netsh interface ipv4 show interfaces` shows the interface's **alias**, which equals the tunnel/client name given at import time (e.g. `work-macbook`), not "WireGuard Tunnel". If a script queries via `netsh` but matches against the description text, it will never find a match — the wait loop hangs forever (a scheduled task query will show `Status: Running` with `Last Result: 267009` stuck indefinitely). The `findstr` pattern in the script must match the **client name**, not "WireGuard Tunnel".
 
-### Running the routing script automatically at boot
+6. **Manually disconnecting and reconnecting WireGuard breaks the routes again, and `-p` doesn't save you**: `-p` persistence handles the case where the adapter stays put but the OS clears its routes (sleep/wake, a brief network drop). But a manual Deactivate/Activate actually tears down and recreates WireGuard's virtual adapter entirely, so any route bound to the old adapter object becomes invalid regardless of persistence. A Scheduled Task that only fires at boot never covers this — it needs to also trigger on network state-change events (see below). And the wait loop must NOT be unbounded: an event trigger can fire for reasons unrelated to WireGuard (e.g. plain Wi-Fi flapping), and if the loop waits forever, combined with the task's `IgnoreNew` setting (to prevent concurrent runs) it will get stuck "running" forever and silently swallow the next legitimate trigger when WireGuard actually reconnects — hence the script needs a timeout.
+
+### Running the routing script automatically at boot and on WireGuard reconnect
 
 Prerequisite: the WireGuard tunnel itself is already set to auto-connect at boot.
 
@@ -279,13 +286,22 @@ Save the script above as `C:\Scripts\wg-routes.bat`, then run once in an elevate
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "C:\Scripts\wg-routes.bat"
-$trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger1 = New-ScheduledTaskTrigger -AtStartup
+
+$class = Get-CimClass MSFT_TaskEventTrigger root/Microsoft/Windows/TaskScheduler
+$trigger2 = New-CimInstance -CimClass $class -ClientOnly
+$trigger2.Subscription = @'
+<QueryList><Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"><Select Path="Microsoft-Windows-NetworkProfile/Operational">*[System[(EventID=10000 or EventID=10001)]]</Select></Query></QueryList>
+'@
+$trigger2.Enabled = $true
+
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "WireGuard-Routes" -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+
+Register-ScheduledTask -TaskName "WireGuard-Routes" -Action $action -Trigger @($trigger1,$trigger2) -Principal $principal -Settings $settings -Force
 ```
 
-This runs as `SYSTEM` at boot with no UAC prompt. The script has a built-in wait loop that polls until the WireGuard tunnel interface is ready before adding routes, avoiding failures from running too early at boot.
+Runs as `SYSTEM`, no UAC prompt. `EventID 10000/10001` (network connected/disconnected) fires on any adapter state change, including a WireGuard disconnect/reconnect. The script is idempotent (delete-then-add for the default route; other routes use `-p` and just report "already exists" harmlessly), so firing more often than strictly necessary is safe. `IgnoreNew` prevents overlapping runs when events fire in bursts — but that only works because the script itself has a timeout (gotcha #6 above); otherwise one stuck wait would block every subsequent trigger.
 
 ### An internal-only company site is unreachable (403 / fake IP)
 
