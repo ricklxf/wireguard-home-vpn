@@ -15,6 +15,7 @@ err()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 
 BREW_PREFIX=$(brew --prefix)
 WG_DIR="${BREW_PREFIX}/etc/wireguard"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 [[ ! -f "$WG_DIR/wg0.conf" ]]        && err "找不到 wg0.conf，请先运行 setup-server.sh"
 [[ ! -f "$WG_DIR/server_public.key" ]] && err "找不到服务端公钥"
@@ -42,7 +43,9 @@ LAST_OCTET=$(grep -oE '10\.13\.13\.([0-9]+)/32' "$WG_DIR/wg0.conf" 2>/dev/null \
 CLIENT_IP="10.13.13.$((LAST_OCTET + 1))"
 
 # ── 生成客户端密钥 ─────────────────────────────────────────────────────────
-CLIENT_DIR="$WG_DIR/clients/$CLIENT_NAME"
+# 生成到脚本所在目录下的 clients/，而不是 root 独占的 $WG_DIR，
+# 这样当前登录用户和 Finder 不用 sudo 也能直接访问、AirDrop 传输
+CLIENT_DIR="$SCRIPT_DIR/clients/$CLIENT_NAME"
 mkdir -p "$CLIENT_DIR"
 chmod 700 "$CLIENT_DIR"
 
@@ -71,6 +74,12 @@ AllowedIPs          = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
 chmod 600 "$CONFIG_FILE"
+
+# 脚本以 sudo 运行，生成的文件默认属主是 root——改回执行 sudo 的那个用户，
+# 否则同样会出现 Finder/AirDrop 因权限不足访问不了的问题
+if [[ -n "${SUDO_USER:-}" ]]; then
+    chown -R "$SUDO_USER" "$CLIENT_DIR"
+fi
 
 # ── 把新 Peer 追加到服务端 wg0.conf ───────────────────────────────────────
 cat >> "$WG_DIR/wg0.conf" <<EOF

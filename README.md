@@ -71,7 +71,7 @@ sudo bash add-client.sh work-macbook <家里的公网IP或域名>
 
 1. 生成客户端密钥对
 2. 分配 VPN 子网 IP（`10.13.13.x`，自动递增）
-3. 生成 `clients/work-macbook/work-macbook.conf`（含 `MTU = 1280`，避免大包被丢弃）
+3. 生成 `clients/work-macbook/work-macbook.conf`（含 `MTU = 1280`，避免大包被丢弃）——生成在脚本所在目录下，属主是执行 `sudo` 的那个用户而不是 root，Finder/AirDrop 不用额外操作就能直接访问
 4. 热更新运行中的 WireGuard（无需重启）
 5. 若已安装 `qrencode`，打印二维码供手机扫码导入
 
@@ -84,6 +84,22 @@ sudo bash add-client.sh work-macbook <家里的公网IP或域名>
 | iOS / Android | 安装 WireGuard App，扫描二维码 |
 
 启用后，`AllowedIPs = 0.0.0.0/0, ::/0` 表示**全部流量**（IPv4 + IPv6）都经 VPN 隧道回家出网。
+
+### 删除客户端（设备丢失或不再使用时）
+
+```bash
+sudo bash remove-client.sh work-macbook
+```
+
+脚本自动完成：
+
+1. 从运行中的 WireGuard 摘除该 peer（立即生效，无需重启）
+2. 从服务端 `wg0.conf` 里删除对应配置
+3. 删除本地保存的密钥和配置文件
+
+删除后即使设备上还留着旧的 `.conf` 文件，也无法再连接。
+
+> 不要一份配置文件给多台设备共用——WireGuard 按私钥识别 peer，多台设备用同一份配置会互相抢占连接，导致反复掉线。每台设备都应该单独用 `add-client.sh` 生成一份。
 
 ---
 
@@ -479,9 +495,11 @@ sudo wg set utun4 peer <客户端公钥> allowed-ips <客户端VPN IP>/32
 
 ### 生成的客户端配置文件在 Finder 里找不到 / `ls` 报 Permission denied
 
-**原因**：`$(brew --prefix)/etc/wireguard/` 整个目录权限是 `700`，属主是 root（保护私钥），当前登录用户和 Finder 都没权限进入，不是文件不存在。
+**原因**：早期版本的 `add-client.sh` 把客户端文件生成在 `$(brew --prefix)/etc/wireguard/clients/` 下，这个目录权限是 `700`、属主是 root（保护服务端私钥），当前登录用户和 Finder 都没权限进入，不是文件不存在。
 
-**解决**：用 `sudo` 把文件复制到有权限的位置（比如桌面）再用 Finder/AirDrop 传输，传完记得删除临时副本（配置文件里含私钥）：
+**修复**：`add-client.sh` 已改为把客户端文件生成在脚本所在目录下的 `clients/`，并 `chown` 回执行 `sudo` 的那个用户，生成后可以直接用 Finder/AirDrop 访问，无需额外操作。
+
+若你的客户端文件是用旧版脚本生成、还留在 `$(brew --prefix)/etc/wireguard/clients/` 下，用 `sudo` 复制出来再传输：
 
 ```bash
 sudo cp $(brew --prefix)/etc/wireguard/clients/<客户端名>/<客户端名>.conf ~/Desktop/
