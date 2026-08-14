@@ -456,6 +456,40 @@ echo 'nat on en0 inet from 10.13.13.0/24 to any -> (en0)' | sudo pfctl -a wiregu
 
 `setup-server.sh` 已修复此 bug，重新运行脚本可一次性修复。
 
+### `wg show wg0` / `add-client.sh` 误判 WireGuard 未运行
+
+**现象**：明明 WireGuard 正常在跑（其他设备能连、能握手），但 `sudo wg show wg0` 报 `Unable to access interface: No such file or directory`，`add-client.sh` 生成新客户端时提示"WireGuard 当前未运行"，新客户端的 peer 没有被热加载。
+
+**原因**：macOS 没有原生 WireGuard 内核模块，`wg-quick` 用通用的 `utun` 接口（如 `utun4`）承载隧道，`wg0`只是`wg-quick`自己在 `/var/run/wireguard/wg0.name` 里记的一个别名，仅供 `wg-quick up/down` 自己使用。原始的 `wg` 命令并不认这个别名，它直接找 `/var/run/wireguard/<接口名>.sock`——传入 `wg0` 时找的是不存在的 `wg0.sock`，而实际的 socket 叫 `utun4.sock`，所以必然报错。
+
+**验证**：
+
+```bash
+sudo wg show
+# 看 "interface: utunN" 这一行，用真实名字重新查
+sudo wg show utunN
+```
+
+**修复**：`add-client.sh` 已改为自动读取 `/var/run/wireguard/wg0.name` 解析出真实接口名再操作，无需手动干预。若使用旧版脚本，手动热加载新 peer：
+
+```bash
+cat /var/run/wireguard/wg0.name   # 查看真实接口名，如 utun4
+sudo wg set utun4 peer <客户端公钥> allowed-ips <客户端VPN IP>/32
+```
+
+### 生成的客户端配置文件在 Finder 里找不到 / `ls` 报 Permission denied
+
+**原因**：`$(brew --prefix)/etc/wireguard/` 整个目录权限是 `700`，属主是 root（保护私钥），当前登录用户和 Finder 都没权限进入，不是文件不存在。
+
+**解决**：用 `sudo` 把文件复制到有权限的位置（比如桌面）再用 Finder/AirDrop 传输，传完记得删除临时副本（配置文件里含私钥）：
+
+```bash
+sudo cp $(brew --prefix)/etc/wireguard/clients/<客户端名>/<客户端名>.conf ~/Desktop/
+sudo chown $(whoami) ~/Desktop/<客户端名>.conf
+# AirDrop 传完后
+rm ~/Desktop/<客户端名>.conf
+```
+
 ---
 
 ## 安全说明

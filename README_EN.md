@@ -456,6 +456,40 @@ echo 'nat on en0 inet from 10.13.13.0/24 to any -> (en0)' | sudo pfctl -a wiregu
 
 `setup-server.sh` has been fixed — re-running the script now fixes this in one shot.
 
+### `wg show wg0` / `add-client.sh` wrongly reports WireGuard as not running
+
+**Symptom**: WireGuard is clearly running fine (other devices can connect and handshake), yet `sudo wg show wg0` fails with `Unable to access interface: No such file or directory`, and `add-client.sh` reports "WireGuard is not currently running" when generating a new client — the new client's peer never gets hot-loaded.
+
+**Cause**: macOS has no native WireGuard kernel module, so `wg-quick` carries the tunnel over a generic `utun` interface (e.g. `utun4`). `wg0` is just an alias `wg-quick` keeps track of itself in `/var/run/wireguard/wg0.name`, used only by `wg-quick up`/`down` internally. The raw `wg` command doesn't understand that alias at all — it looks directly for `/var/run/wireguard/<interface-name>.sock`. Passing `wg0` makes it look for a nonexistent `wg0.sock`, while the real socket is named `utun4.sock`, so it always fails.
+
+**Verify**:
+
+```bash
+sudo wg show
+# Note the "interface: utunN" line, then query again with the real name
+sudo wg show utunN
+```
+
+**Fix**: `add-client.sh` now automatically reads `/var/run/wireguard/wg0.name` to resolve the real interface name before operating on it — no manual intervention needed. If you're on an older version of the script, hot-load the new peer manually:
+
+```bash
+cat /var/run/wireguard/wg0.name   # shows the real interface name, e.g. utun4
+sudo wg set utun4 peer <client public key> allowed-ips <client VPN IP>/32
+```
+
+### Can't find the generated client config in Finder / `ls` reports Permission denied
+
+**Cause**: the entire `$(brew --prefix)/etc/wireguard/` directory is `700`, owned by root (to protect the private keys). The logged-in user and Finder have no permission to enter it — the file isn't missing, it's just inaccessible.
+
+**Fix**: use `sudo` to copy the file somewhere accessible (like the Desktop) for Finder/AirDrop, then delete the temporary copy afterward (the config file contains a private key):
+
+```bash
+sudo cp $(brew --prefix)/etc/wireguard/clients/<client-name>/<client-name>.conf ~/Desktop/
+sudo chown $(whoami) ~/Desktop/<client-name>.conf
+# After AirDropping it
+rm ~/Desktop/<client-name>.conf
+```
+
 ---
 
 ## Security notes

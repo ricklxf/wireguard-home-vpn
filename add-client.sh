@@ -82,9 +82,14 @@ AllowedIPs = ${CLIENT_IP}/32
 EOF
 
 # ── 热更新服务端（无需重启 WireGuard）────────────────────────────────────
-if wg show wg0 &>/dev/null 2>&1; then
+# macOS 上 wg-quick 用 utunN 作为真实接口，wg0 只是 /var/run/wireguard/wg0.name
+# 里记录的别名，原始的 wg 命令不认这个别名，必须解析出真实接口名再操作
+WG_REAL_IF=""
+[[ -f /var/run/wireguard/wg0.name ]] && WG_REAL_IF=$(cat /var/run/wireguard/wg0.name)
+
+if [[ -n "$WG_REAL_IF" ]] && wg show "$WG_REAL_IF" &>/dev/null 2>&1; then
     log "热加载新 Peer 到运行中的 WireGuard..."
-    wg set wg0 peer "$CLIENT_PUBLIC" allowed-ips "${CLIENT_IP}/32"
+    wg set "$WG_REAL_IF" peer "$CLIENT_PUBLIC" allowed-ips "${CLIENT_IP}/32"
 else
     warn "WireGuard 当前未运行，配置已写入，下次启动生效"
 fi
