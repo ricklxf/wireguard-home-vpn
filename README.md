@@ -221,6 +221,111 @@ sudo tcpdump -ni en0 udp port 51820
 
 ---
 
+## 服务端搬到群晖 / Linux（当客户端 IP 不固定、又要保留 Surge 完整接管时）
+
+### 背景：`tun-excluded-routes` 方案的边界
+
+上一节的 `tun-excluded-routes` 方案能让 Windows 稳定连回家，前提是**客户端的公网 IP 落在一个提前配置好的固定网段里**（比如公司出口 117.133.0.0/16）。这个前提对手机不成立——手机在外面用流量或不同 WiFi，公网 IP 每次都不一样，没法用一份静态排除列表覆盖。
+
+而且如果要求"Surge 继续完整接管这台 Mac 的所有流量"（不是只排除 WireGuard 那一段），问题会变成：**同一台机器上，既要 Surge 全权接管默认路由，又要 WireGuard 的服务端进程精确绕开它**。这在 macOS 上被证明走不通：
+
+- **`PROCESS-NAME,wireguard-go,DIRECT`**：对 UDP 无效（Surge 处理 UDP 时不看这条规则，命中数永远是 0）
+- **`AND,((PROTOCOL,UDP),(IN-PORT,51820)),DIRECT`**：同样无效，Surge 的 Rule 引擎主要针对"进程主动发起连接"，不覆盖"本机监听端口被动回包"这种场景
+- **pf 的 `route-to`**：即使把包强制指定走物理网卡，Surge 依然能在更底层（很可能是 Network Extension 框架）截获并改写源地址——`route-to` 改变的是路由表层面的选路，Surge 的拦截根本不经过这一层判断
+- **换一台不跑 Surge/Clash 的 "干净" Mac**：如果那台机器本身也装了 Clash 内核的代理客户端（比如 OKZ）并开着 TUN 模式，会复现一模一样的问题——**任何在本机开 TUN 模式的代理客户端，都会拦截同机 WireGuard 服务端的回包**，这不是 Surge 独有的问题
+- **pf 的 `route-to`/`reply-to` 用在"本机自己生成的 UDP 回包"上，在完全没有代理软件干扰的 Mac 上单独测试依然大概率失败**——这是 macOS 这个 pf fork 本身策略路由能力偏弱的问题，不是被代理软件抢流量导致的
+
+### 能用的方案：Linux 的 `ip rule` 策略路由
+
+macOS 缺的这块能力，Linux 的 `ip rule` 天生就有，而且可靠：
+
+```bash
+# 只有源地址是 VPN 子网的流量，才走这张单独的路由表
+ip rule add from 10.13.13.0/24 lookup 100
+ip route add default via 192.168.1.254 table 100   # 192.168.1.254 是 Surge 网关模式的虚拟网关
+```
+
+WireGuard 自己生成的握手/回包（源地址是本机 IP，不是 `10.13.13.x`）根本不会匹配这条规则，天然走主路由表的默认网关（家用路由器），不经过 Surge；只有客户端解密后的真实流量（源地址是 `10.13.13.x`）会被单独拎出来送进 Surge 网关。两层互不干扰，第一次测试就成功，跟 macOS 上折腾一整晚形成鲜明对比。
+
+### 部署方式：Docker 容器 + `--network host`
+
+不需要专门装 Linux，群晖这类 NAS（DSM 底层是 Linux）用 Docker 就能跑：
+
+```bash
+# 拉取用户态 WireGuard 镜像（不依赖内核版本，DSM 升级也不受影响）
+docker pull masipcat/wireguard-go:latest
+
+# 用 --network host 让容器直接操作宿主机的网络栈（wg0 接口、路由表、iptables 都在宿主机层面生效）
+docker run -d \
+  --name wireguard \
+  --network host \
+  --cap-add NET_ADMIN \
+  --cap-add SYS_MODULE \
+  --device /dev/net/tun \
+  -v /volume1/docker/wireguard/wg0.conf:/etc/wireguard/wg0.conf \
+  --restart unless-stopped \
+  masipcat/wireguard-go:latest
+```
+
+`wg0.conf` 沿用原来 Mac 服务端的私钥和已注册的 peer（**私钥原样迁移，不要重新生成**），这样客户端的 `Endpoint`、服务端公钥都不用变，Windows/手机的配置文件一个字都不用改：
+
+```ini
+[Interface]
+PrivateKey = <原服务端私钥，原样迁移>
+Address    = 10.13.13.1/24
+ListenPort = 51820
+PostUp     = iptables -t nat -A POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule add from 10.13.13.0/24 lookup 100; ip route add default via 192.168.1.254 table 100
+PostDown   = iptables -t nat -D POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule del from 10.13.13.0/24 lookup 100 2>/dev/null || true; ip route del default via 192.168.1.254 table 100 2>/dev/null || true
+
+# Client: work-macbook
+[Peer]
+PublicKey  = <客户端公钥>
+AllowedIPs = 10.13.13.2/32
+
+# Client: iphone
+[Peer]
+PublicKey  = <客户端公钥>
+AllowedIPs = 10.13.13.3/32
+```
+
+`eth0` 换成 NAS 实际的物理网卡名，`192.168.1.254` 换成 Surge 网关模式实际的虚拟网关地址。
+
+路由器的端口映射（UDP 51820）目标 IP 改成 NAS 的内网 IP，其余不变。
+
+### 验证
+
+```bash
+# 容器内查看握手状态
+docker exec wireguard wg show
+# 应该能看到 latest handshake 和持续增长的 transfer 数据，不是只有 endpoint 没有握手时间
+
+# 宿主机上抓包确认外层握手走的是路由器，不是 Surge
+tcpdump -ni eth0 udp port 51820
+# 回包源地址应该是 NAS 自己的内网 IP，且行为应该是密集的双向小包（握手完成后的正常数据），
+# 不是每 5 秒一次孤零零的 148 字节握手重试包（那是握手一直没成功的典型症状）
+
+# 客户端侧确认分流生效
+# 手机浏览器打开 ip.sb / ipinfo.io，出口 IP 应该是 Surge 代理节点的 IP，不是家里的公网 IP
+```
+
+### 七个关键坑
+
+1. **不要把"Surge 拦截 WireGuard 回包"和"macOS pf 策略路由本身不可靠"当成一回事**：即使换到一台完全没装任何代理软件的干净 Mac，本机自己生成的 UDP 回包用 `route-to`/`reply-to` 单独测试依然大概率失败。只有排除掉 Surge/Clash 这些因素，回到最简单的"默认网关直接指向路由器、不做任何策略路由"，才能确认握手链路本身没问题——这是必须先钉死的 baseline，否则会在错误的假设上反复浪费时间。
+
+2. **任何在本机开 TUN 模式的代理客户端都会拦截同机 WireGuard 的回包，不只是 Surge**：换到另一台 Mac 之前，先确认那台机器上是否也装了 Clash 内核之类的代理工具（`ps aux | grep -i clash` 或查看是否有额外的 `utun` 接口带着 `198.18.x.x` 这种 fake-ip 网段的地址）。
+
+3. **验证"流量到底被谁处理"，不能只看包在哪块网卡上出现过**：同一局域网段内，交换机/路由器有时候会让流量在"没有实际处理这个连接"的机器网卡上也被抓到（顺路可见），必须用 `wg show` 确认该机器上有没有真实的握手记录和流量统计，而不是靠 `tcpdump` 抓到包就下结论。
+
+4. **Surge/Clash 的"网关模式"要求设备真的通过它的 DHCP 获取网络配置，不能只是运行时改一下默认路由**：用 `route change default <虚拟网关IP>` 这种命令行操作往往不会真正生效或不稳定，必须在系统网络设置里手动配置完整的 TCP/IP（IP、子网掩码、网关、DNS 全部指定），或者让设备重新走一次 DHCP 由代理软件的 DHCP 服务器分配。
+
+5. **macOS 的 `pf.conf` 里，NAT 规则和过滤规则（`route-to`/`reply-to`/`pass`）需要分别声明 `nat-anchor` 和普通 `anchor`，二者是两套独立的锚点**：只声明了 `nat-anchor "wireguard"` 时，往同名 anchor 里加载过滤规则（比如 `route-to`）不会报错，但也根本不会生效，容易误判"规则加了但没用"，其实是锚点声明本身就不完整。
+
+6. **`pf` 的状态表（state table）不会因为新加了规则就自动失效**：如果客户端一直在用同一个源端口反复重试连接，新加的 `route-to`/`reply-to` 规则对已经建立的连接状态不生效，必须 `pfctl -F states` 清空状态表，并且让客户端**完全断开重连**（换一个新的源端口）才能验证新规则是否真的起作用，否则会得到"规则加了但还是不行"的假阴性结论。
+
+7. **TCP 服务受 pf `route-to`/`reply-to` 不稳定的影响，比 UDP 服务小得多**：macOS pf 对 TCP 的连接状态追踪明显比 UDP 可靠，如果只是让某个本机 TCP 服务（比如远程桌面工具的 WebSocket 端口）绕开 Surge/Clash 的网关接管，`reply-to` 大概率能稳定生效，不需要像 WireGuard（UDP）这样被迫换到 Linux 设备。
+
+---
+
 ## Windows 客户端分流方案（内网走公司，外网走家里）
 
 需求：公司电脑连 VPN 后，访问公司内网（打印机、内网系统）走公司本地网络，其余流量（含被墙网站）经家里出网。

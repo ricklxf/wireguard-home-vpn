@@ -221,6 +221,115 @@ sudo tcpdump -ni en0 udp port 51820
 
 ---
 
+## Moving the server to Synology / Linux (when the client's IP isn't fixed and Surge still needs full control)
+
+### Background: the limits of `tun-excluded-routes`
+
+The `tun-excluded-routes` approach above gets Windows reliably connected home, but it depends on **the client's public IP falling inside a pre-configured, fixed range** (e.g. the office's 117.133.0.0/16 exit). That premise doesn't hold for a phone — out on cellular data or a random Wi-Fi network, its public IP is different every time, so no static exclusion list can cover it.
+
+And if the requirement is "Surge keeps full control of this Mac's traffic" (not just "exclude WireGuard's one path"), the problem becomes: **on the same machine, Surge needs to fully own the default route, while the WireGuard server process needs to precisely route around it.** This turns out not to be solvable on macOS:
+
+- **`PROCESS-NAME,wireguard-go,DIRECT`**: has no effect on UDP (Surge's UDP handling ignores this rule entirely — hit count stays at 0)
+- **`AND,((PROTOCOL,UDP),(IN-PORT,51820)),DIRECT`**: also has no effect — Surge's Rule engine is built around "a process actively opening a connection," not "a locally listening port passively replying to inbound traffic"
+- **pf's `route-to`**: even after forcing the packet's route to leave via the physical NIC, Surge still intercepts and rewrites the source address at a lower level (most likely via the Network Extension framework) — `route-to` only changes the routing-table-level path selection, and Surge's interception doesn't go through that layer at all
+- **Switching to a "clean" Mac without Surge**: if that machine also runs a Clash-core proxy client (like OKZ) with TUN mode enabled, the exact same problem reappears — **any locally running proxy client in TUN mode will intercept the same-machine WireGuard server's reply packets.** This isn't specific to Surge.
+- **pf's `route-to`/`reply-to` applied to "a UDP reply the local machine itself generated," tested in isolation on a Mac with zero competing proxy software, still fails more often than not** — this is a weakness of macOS's own pf fork's policy-routing support, not a symptom of proxy software stealing traffic.
+
+### What actually works: Linux's `ip rule` policy routing
+
+The capability macOS lacks is native and reliable on Linux:
+
+```bash
+# Only traffic sourced from the VPN subnet uses this separate routing table
+ip rule add from 10.13.13.0/24 lookup 100
+ip route add default via 192.168.1.254 table 100   # 192.168.1.254 is Surge's Gateway Mode virtual gateway
+```
+
+WireGuard's own handshake/reply packets (sourced from the local machine's own IP, not `10.13.13.x`) never match this rule at all — they naturally fall through to the main table's default route (the home router), bypassing Surge entirely. Only the client's decrypted real traffic (sourced from `10.13.13.x`) gets pulled out and sent to Surge's gateway. The two layers never interfere with each other, and it worked on the first try — a sharp contrast to an entire night spent fighting macOS.
+
+### Deployment: a Docker container with `--network host`
+
+No need for a dedicated Linux box — a NAS like Synology (DSM's underlying OS is Linux) can run this via Docker:
+
+```bash
+# Pull a userspace WireGuard image (no kernel-version dependency, unaffected by DSM upgrades)
+docker pull masipcat/wireguard-go:latest
+
+# --network host lets the container operate directly on the host's network stack
+# (the wg0 interface, routing table, and iptables rules all take effect at the host level)
+docker run -d \
+  --name wireguard \
+  --network host \
+  --cap-add NET_ADMIN \
+  --cap-add SYS_MODULE \
+  --device /dev/net/tun \
+  -v /volume1/docker/wireguard/wg0.conf:/etc/wireguard/wg0.conf \
+  --restart unless-stopped \
+  masipcat/wireguard-go:latest
+```
+
+`wg0.conf` reuses the original Mac server's private key and already-registered peers (**migrate the private key as-is — don't regenerate it**), so the client's `Endpoint` and the server's public key never change — the Windows/phone config files don't need a single character edited:
+
+```ini
+[Interface]
+PrivateKey = <original server private key, migrated as-is>
+Address    = 10.13.13.1/24
+ListenPort = 51820
+PostUp     = iptables -t nat -A POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule add from 10.13.13.0/24 lookup 100; ip route add default via 192.168.1.254 table 100
+PostDown   = iptables -t nat -D POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule del from 10.13.13.0/24 lookup 100 2>/dev/null || true; ip route del default via 192.168.1.254 table 100 2>/dev/null || true
+
+# Client: work-macbook
+[Peer]
+PublicKey  = <client public key>
+AllowedIPs = 10.13.13.2/32
+
+# Client: iphone
+[Peer]
+PublicKey  = <client public key>
+AllowedIPs = 10.13.13.3/32
+```
+
+Swap `eth0` for the NAS's actual physical interface name, and `192.168.1.254` for Surge Gateway Mode's actual virtual gateway address.
+
+Update the router's port forward (UDP 51820) to point at the NAS's LAN IP — nothing else changes.
+
+### Verification
+
+```bash
+# Inside the container, check handshake state
+docker exec wireguard wg show
+# Should show a latest handshake and steadily growing transfer counters —
+# not just an endpoint with no handshake time
+
+# On the host, confirm the outer handshake goes via the router, not Surge
+tcpdump -ni eth0 udp port 51820
+# The reply's source address should be the NAS's own LAN IP, and traffic should look like
+# dense, bidirectional, variably-sized packets (normal post-handshake data) —
+# not a lone 148-byte handshake-retry packet every 5 seconds (the classic sign of a stuck handshake)
+
+# On the client, confirm split-tunneling is active
+# Open ip.sb / ipinfo.io in the phone's browser — the exit IP should be a Surge proxy node's IP,
+# not the home's public IP
+```
+
+### Seven key gotchas
+
+1. **Don't conflate "Surge intercepts WireGuard's replies" with "macOS pf's policy routing is unreliable in general"**: even on a completely clean Mac with no proxy software installed at all, testing `route-to`/`reply-to` on a locally-generated UDP reply still fails more often than not. Only after ruling out Surge/Clash entirely — falling back to the simplest baseline of "default gateway points straight at the router, no policy routing at all" — can you confirm the handshake path itself is sound. Pin down this baseline first, or you'll waste time repeatedly testing against the wrong assumption.
+
+2. **Any locally running TUN-mode proxy client intercepts the same-machine WireGuard server's replies — not just Surge**: before switching to a different Mac, check whether it also has a Clash-core proxy tool installed (`ps aux | grep -i clash`, or look for an extra `utun` interface carrying a `198.18.x.x`-style fake-IP address).
+
+3. **Verifying "who's actually handling this traffic" can't rely on which NIC saw the packet**: on the same LAN segment, a switch/router will sometimes let traffic show up on a machine's NIC that isn't actually processing the connection at all (visible in passing). You have to confirm via `wg show` that the machine genuinely has a handshake record and transfer stats — not just conclude from a `tcpdump` capture.
+
+4. **Surge/Clash's "Gateway Mode" requires the device to actually obtain its network config via its DHCP server — a runtime default-route change isn't enough**: commands like `route change default <virtual-gateway-IP>` often don't take effect reliably. You need to either manually configure the full TCP/IP settings (IP, subnet mask, gateway, DNS all explicit) in system network settings, or have the device redo DHCP so the proxy software's own DHCP server assigns it.
+
+5. **On macOS, `pf.conf` needs NAT rules and filter rules (`route-to`/`reply-to`/`pass`) declared under separate anchor types — `nat-anchor` and a plain `anchor` are two independent anchor points**: if only `nat-anchor "wireguard"` is declared, loading filter rules (like `route-to`) into the same-named anchor won't error, but also won't take effect at all — easy to misdiagnose as "the rule loaded but doesn't work" when actually the anchor declaration itself is incomplete.
+
+6. **pf's state table doesn't automatically invalidate just because a new rule was added**: if the client keeps retrying from the same source port, a newly added `route-to`/`reply-to` rule won't apply to the already-established connection state. You must run `pfctl -F states` to clear it, and have the client **fully disconnect and reconnect** (getting a fresh source port) to actually test whether the new rule works — otherwise you'll get a false-negative "added the rule but it still doesn't work."
+
+7. **TCP services are far less affected by pf's `route-to`/`reply-to` unreliability than UDP services are**: macOS pf's connection-state tracking is noticeably more reliable for TCP than for UDP. If you just need a local TCP service (e.g. a remote-desktop tool's WebSocket port) to bypass Surge/Clash's gateway takeover, `reply-to` will likely work reliably — no need to migrate to a Linux box the way WireGuard (UDP) required.
+
+---
+
 ## Windows client split-tunneling (company LAN local, everything else via home)
 
 Goal: once connected, traffic to the company LAN (printer, internal systems) should stay local, while everything else (including blocked sites) should route home through the tunnel.
