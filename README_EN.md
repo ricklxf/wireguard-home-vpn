@@ -2,261 +2,100 @@
 
 # WireGuard Home VPN
 
-Route all traffic from a work computer through a home macOS machine.
+The server runs on a Synology NAS (Docker), routing traffic from a work computer or phone home through your house; meanwhile a Mac on the same network keeps running Surge with full traffic-splitting control, and the two don't interfere with each other.
 
 ## Architecture
 
 ```
-Work computer (client)
+Work computer / phone (client)
     │
     │  WireGuard encrypted tunnel (UDP 51820)
     │
-Home router (port forward 51820 → Mac)
+Home router (port forward 51820 → NAS)
     │
-Home Mac (server)
-    ├─ WireGuard decryption
-    ├─ IP forwarding (net.inet.ip.forwarding)
-    ├─ pfctl NAT (source address rewrite)
-    └─── Home broadband ─── Internet
+Synology NAS (server, Docker container --network host)
+    ├─ wg0 interface decrypts, source address 10.13.13.x
+    │
+    ├─ Outer layer: WireGuard's own handshake/reply packets (sourced from the NAS's own IP)
+    │   └─ Uses the main routing table's default gateway → home router → straight to the internet
+    │
+    └─ Inner layer: the client's decrypted real traffic (sourced from 10.13.13.x)
+        └─ Policy-routed via ip rule to → the Mac's Surge Gateway Mode → split per Surge's rules
 ```
+
+The outer layer (the tunnel itself) and the inner layer (the real traffic inside the tunnel) take two completely independent paths that never interfere with each other — this is the key that lets this setup satisfy both "the VPN reliably connects" and "traffic goes through Surge's splitting" at the same time.
+
+## Why the server lives on a NAS instead of directly on the Mac
+
+The most direct approach is to run WireGuard right on the home Mac that already runs Surge. That's fine as long as all you need is "the client can connect home" — but the moment you also require "Surge keeps full control of everything this Mac does," it becomes: **on the same machine, Surge needs to fully own the default route, while the WireGuard server process needs to precisely route around it.** This has been repeatedly proven not to work on macOS:
+
+- Surge's `PROCESS-NAME` and `IN-PORT` rules have no effect on UDP — hit count stays at 0
+- macOS's `pf` policy routing (`route-to`/`reply-to`), even with zero interfering proxy software, still fails more often than not when applied to "a UDP reply the local machine itself generated" — this is a weakness of macOS's own pf fork's policy-routing support, not something caused by proxy software stealing traffic
+- Switching to a "clean" Mac doesn't help either — as long as that machine runs ANY TUN-mode proxy client (Surge, a Clash core, etc.), it will intercept the same-machine WireGuard's replies. This isn't specific to Surge.
+
+Linux's `ip rule`, on the other hand, has reliable native policy routing — it worked on the first try. A NAS like Synology runs Linux under the hood, so a userspace WireGuard image in Docker gets the job done without buying extra hardware.
+
+> If your setup doesn't need "Surge/Clash fully owning the machine + WireGuard coexisting" (say, you only have one Mac at home and it doesn't run a persistent TUN proxy), it's simpler to just use this repo's `setup-server.sh` directly on the Mac — see "Native Mac deployment (when you don't need Surge/Clash coexistence)" at the bottom.
+
+### Alternatives if you don't have a Synology
+
+The core requirements are just two: runs Linux (for reliable `ip rule` policy routing), and stays on 24/7. Anything meeting both can substitute for a Synology:
+
+| Device | Feasibility | Notes |
+|---|---|---|
+| Soft router / OpenWrt router | Best | Often has kernel-module WireGuard support for the best performance; native policy routing; it's already the gateway, so there's no "reply takes a different path" problem to begin with |
+| Raspberry Pi | Great | A Pi Zero 2W (tens of dollars) is plenty; full Linux, `ip rule` configures freely; power draw is tiny, well suited to running 24/7 |
+| Spare x86 mini PC | Good | Install Debian/Ubuntu — same capability as a Pi, more performance |
+| Synology or similar NAS | Great | What this doc uses, assuming you already have a NAS running 24/7 |
+| Cloud VPS | Wrong fit | Technically the easiest, but the exit IP belongs to the datacenter, not your home — defeats the whole point of "route home" |
+| Mac | Not suited to coexisting with Surge/Clash | Repeatedly confirmed that macOS's pf policy routing is unreliable; fine if you're only running WireGuard with no splitting requirement |
+
+---
 
 ## Prerequisites
 
-- Home Mac: macOS 12+, with [Homebrew](https://brew.sh) installed
+- A NAS or Linux box that stays on 24/7 and supports Docker (this doc uses Synology DSM 7.2 as the example)
 - Home router: supports port forwarding
 - A static public IP at home (or DDNS already configured)
+- If there's a Surge/Clash-style splitting tool somewhere on the network and you want the inner traffic to go through it too, that tool needs to support "Gateway Mode" (acting as the gateway for other LAN devices) — note down its virtual gateway IP
 
 ---
 
-## Usage
+## Deploying the server
 
-### Step 1: Initialize the server on the home Mac
+### Step 1: Generate the server keypair
 
-```bash
-sudo bash setup-server.sh
-```
-
-The script automatically:
-
-1. Installs `wireguard-tools` (via Homebrew)
-2. Generates the server's Curve25519 keypair, stored in `$(brew --prefix)/etc/wireguard/`
-3. Auto-detects the physical WAN interface (excluding virtual utun interfaces created by software like Surge)
-4. Generates `wg0.conf` with single-line PostUp/PostDown (wg-quick doesn't support `\` line continuation)
-5. Registers a `wireguard` anchor in `/etc/pf.conf` (auto-backs up the original file on first run)
-6. Registers the service under `/Library/LaunchDaemons/` to start on boot
-
-### Step 2: Configure port forwarding on the home router
-
-Forward **UDP 51820** to the home Mac's LAN IP.
-
-> The exact steps vary by router brand, usually under "Virtual Server" or "Port Forwarding".
-> Find the Mac's LAN IP in System Settings → Network, or run `ipconfig getifaddr en0`.
-
-Port forwarding fields:
-
-| Field | Value |
-|------|----|
-| Protocol | UDP |
-| External port | 51820 |
-| Internal IP | Mac's LAN IP |
-| Internal port | 51820 |
-
-### Step 3: Generate a client config for the work computer
+On the NAS (or any machine that can run the `wg` command):
 
 ```bash
-sudo bash add-client.sh work-macbook <home public IP or domain>
+wg genkey | tee server_private.key | wg pubkey > server_public.key
 ```
 
-The script automatically:
-
-1. Generates a client keypair
-2. Assigns a VPN subnet IP (`10.13.13.x`, auto-incrementing)
-3. Generates `clients/work-macbook/work-macbook.conf` (includes `MTU = 1280` to avoid large packets being dropped) — written next to the script itself and owned by the user who ran `sudo`, not root, so Finder/AirDrop can access it directly with no extra steps
-4. Hot-reloads the running WireGuard instance (no restart needed)
-5. Prints a QR code for mobile import if `qrencode` is installed
-
-### Step 4: Import the config on the work computer
-
-| System | Method |
-|------|------|
-| macOS / Windows | Install the [WireGuard App](https://www.wireguard.com/install/), import the `.conf` file |
-| Linux | `sudo wg-quick up /path/to/work-macbook.conf` |
-| iOS / Android | Install the WireGuard App, scan the QR code |
-
-Once enabled, `AllowedIPs = 0.0.0.0/0, ::/0` means **all traffic** (IPv4 + IPv6) is routed home through the VPN tunnel.
-
-### Removing a client (lost device or no longer needed)
+### Step 2: Write `wg0.conf`
 
 ```bash
-sudo bash remove-client.sh work-macbook
+sudo mkdir -p /volume1/docker/wireguard
+sudo tee /volume1/docker/wireguard/wg0.conf > /dev/null <<'EOF'
+[Interface]
+PrivateKey = <contents of server_private.key>
+Address    = 10.13.13.1/24
+ListenPort = 51820
+PostUp     = iptables -t nat -A POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule add from 10.13.13.0/24 lookup 100; ip route add default via 192.168.1.254 table 100
+PostDown   = iptables -t nat -D POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule del from 10.13.13.0/24 lookup 100 2>/dev/null || true; ip route del default via 192.168.1.254 table 100 2>/dev/null || true
+EOF
+sudo chmod 600 /volume1/docker/wireguard/wg0.conf
 ```
 
-The script automatically:
+- Swap `eth0` for the NAS's actual physical interface name
+- Swap `192.168.1.254` for the actual virtual gateway address of your Surge/Clash Gateway Mode; if you don't need inner-traffic splitting at all, drop the `ip rule`/`ip route` lines and keep only the `iptables` NAT rule — that's equivalent to a plain WireGuard server
 
-1. Removes the peer from the running WireGuard instance (takes effect immediately, no restart needed)
-2. Deletes the corresponding config from the server's `wg0.conf`
-3. Deletes the locally stored keys and config file
+At this point `wg0.conf` has no `[Peer]` entries yet — see "Adding clients" below.
 
-Once removed, the device can no longer connect even if it still has the old `.conf` file.
-
-> Don't share one config file across multiple devices — WireGuard identifies peers by private key, so multiple devices using the same config will fight over the connection and keep dropping. Generate a separate one per device with `add-client.sh`.
-
----
-
-## Verification
-
-After connecting, on the work computer:
+### Step 3: Start the Docker container
 
 ```bash
-# The exit IP should show your home public IP
-curl https://ifconfig.me
-
-# Ping the VPN gateway
-ping 10.13.13.1
-
-# Ping an external host (verify forwarding and NAT)
-ping 8.8.8.8
-```
-
-Check connection status on the server:
-
-```bash
-sudo wg show
-# Should show peer, handshake time, traffic stats
-```
-
----
-
-## How it works
-
-### WireGuard protocol
-
-- Built on **UDP**, low latency, NAT-traversal friendly
-- Fixed crypto suite: Curve25519 (key exchange) + ChaCha20-Poly1305 (encryption) + BLAKE2s (hashing)
-- No negotiation phase, so no room for "misconfiguration" — minimal attack surface
-- ~4000 lines of code, independently audited (Trail of Bits, 2019)
-- Merged into Linux kernel 5.6 in 2020; macOS uses the userspace `wireguard-go`
-
-### TUN virtual interface
-
-`wg-quick up wg0` creates a virtual network interface on the system (named `utun*` on macOS).
-Outbound app traffic is routed to `utun*`, encrypted by WireGuard, and sent out the real interface;
-incoming UDP packets are decrypted and written back to `utun*`, transparent to upper-layer apps.
-
-### IP forwarding
-
-```bash
-sysctl -w net.inet.ip.forwarding=1
-```
-
-By default macOS only forwards packets destined for itself; enabling this lets the kernel forward "passing-through" packets,
-so the work computer's traffic can reach the internet via the Mac.
-
-### pfctl NAT
-
-The work computer's VPN IP (`10.13.13.x`) is a private address the internet doesn't recognize.
-The NAT rule rewrites the source address of outbound packets to the Mac's own IP:
-
-```
-Original packet: src=10.13.13.2  dst=8.8.8.8
-After NAT:       src=192.168.1.4  dst=8.8.8.8   ← what the internet sees
-Reply:           src=8.8.8.8     dst=192.168.1.4
-Restored:        src=8.8.8.8     dst=10.13.13.2 ← sent back to the work computer
-```
-
-pfctl restores reply packets automatically via its connection state table — no manual intervention needed.
-
-### MTU
-
-WireGuard encapsulation adds roughly 60 bytes of header overhead.
-The client config defaults to `MTU = 1280` (a conservative value) to prevent large packets from exceeding the physical NIC's MTU (1500) and being dropped.
-ICMP pings are small and unaffected; without an MTU setting, large TCP/HTTPS packets often produce the "ping works but web pages won't load" symptom.
-
-### LaunchDaemon (start on boot)
-
-Registered under `/Library/LaunchDaemons/`, runs as root at system startup,
-and brings up WireGuard automatically even before any user logs in.
-
----
-
-## Surge compatibility
-
-If the home Mac also runs Surge, extra configuration is needed — otherwise WireGuard's reply packets get hijacked by Surge.
-
-### Root cause
-
-Surge's Enhanced Mode takes over the system routing table, so all outbound traffic goes through Surge's virtual interface.
-When WireGuard sends a reply packet to the work computer, Surge intercepts it and **rewrites the source address to Surge's virtual IP (`198.18.0.1`)**.
-The work computer doesn't recognize this address, and the handshake fails.
-
-> A `PROCESS-NAME,wireguard-go,DIRECT` rule has no effect on UDP — Surge still forwards UDP via its virtual IP regardless of a DIRECT rule.
-
-### Fix
-
-In Surge's config file, add the work computer's IP range to `tun-excluded-routes` under `[General]`:
-
-```ini
-[General]
-tun-excluded-routes = 117.133.0.0/16
-```
-
-This tells Surge not to route traffic destined for that IP range through its TUN, so WireGuard's reply packets go out directly via the physical NIC (`en0`) with the correct source address.
-
-After reloading the config, verify with tcpdump on the Mac:
-
-```bash
-sudo tcpdump -ni en0 udp port 51820
-# Reply source address should be 192.168.1.x, not 198.18.0.1
-```
-
-### Behavior summary by mode
-
-| Surge mode | No extra config | With tun-excluded-routes |
-|-----------|------------|----------------------|
-| System proxy only | ✅ Works | Not needed |
-| Enhanced Mode | ❌ Wrong reply source IP, handshake fails | ✅ Works |
-| Both enabled | ❌ Same as Enhanced Mode | ✅ Works |
-
-> **Note**: `tun-excluded-routes` excludes by destination IP — update it manually if the work computer's IP range changes.
-
----
-
-## Moving the server to Synology / Linux (when the client's IP isn't fixed and Surge still needs full control)
-
-### Background: the limits of `tun-excluded-routes`
-
-The `tun-excluded-routes` approach above gets Windows reliably connected home, but it depends on **the client's public IP falling inside a pre-configured, fixed range** (e.g. the office's 117.133.0.0/16 exit). That premise doesn't hold for a phone — out on cellular data or a random Wi-Fi network, its public IP is different every time, so no static exclusion list can cover it.
-
-And if the requirement is "Surge keeps full control of this Mac's traffic" (not just "exclude WireGuard's one path"), the problem becomes: **on the same machine, Surge needs to fully own the default route, while the WireGuard server process needs to precisely route around it.** This turns out not to be solvable on macOS:
-
-- **`PROCESS-NAME,wireguard-go,DIRECT`**: has no effect on UDP (Surge's UDP handling ignores this rule entirely — hit count stays at 0)
-- **`AND,((PROTOCOL,UDP),(IN-PORT,51820)),DIRECT`**: also has no effect — Surge's Rule engine is built around "a process actively opening a connection," not "a locally listening port passively replying to inbound traffic"
-- **pf's `route-to`**: even after forcing the packet's route to leave via the physical NIC, Surge still intercepts and rewrites the source address at a lower level (most likely via the Network Extension framework) — `route-to` only changes the routing-table-level path selection, and Surge's interception doesn't go through that layer at all
-- **Switching to a "clean" Mac without Surge**: if that machine also runs a Clash-core proxy client (like OKZ) with TUN mode enabled, the exact same problem reappears — **any locally running proxy client in TUN mode will intercept the same-machine WireGuard server's reply packets.** This isn't specific to Surge.
-- **pf's `route-to`/`reply-to` applied to "a UDP reply the local machine itself generated," tested in isolation on a Mac with zero competing proxy software, still fails more often than not** — this is a weakness of macOS's own pf fork's policy-routing support, not a symptom of proxy software stealing traffic.
-
-### What actually works: Linux's `ip rule` policy routing
-
-The capability macOS lacks is native and reliable on Linux:
-
-```bash
-# Only traffic sourced from the VPN subnet uses this separate routing table
-ip rule add from 10.13.13.0/24 lookup 100
-ip route add default via 192.168.1.254 table 100   # 192.168.1.254 is Surge's Gateway Mode virtual gateway
-```
-
-WireGuard's own handshake/reply packets (sourced from the local machine's own IP, not `10.13.13.x`) never match this rule at all — they naturally fall through to the main table's default route (the home router), bypassing Surge entirely. Only the client's decrypted real traffic (sourced from `10.13.13.x`) gets pulled out and sent to Surge's gateway. The two layers never interfere with each other, and it worked on the first try — a sharp contrast to an entire night spent fighting macOS.
-
-### Deployment: a Docker container with `--network host`
-
-No need for a dedicated Linux box — a NAS like Synology (DSM's underlying OS is Linux) can run this via Docker:
-
-```bash
-# Pull a userspace WireGuard image (no kernel-version dependency, unaffected by DSM upgrades)
 docker pull masipcat/wireguard-go:latest
 
-# --network host lets the container operate directly on the host's network stack
-# (the wg0 interface, routing table, and iptables rules all take effect at the host level)
 docker run -d \
   --name wireguard \
   --network host \
@@ -268,71 +107,94 @@ docker run -d \
   masipcat/wireguard-go:latest
 ```
 
-`wg0.conf` reuses the original Mac server's private key and already-registered peers (**migrate the private key as-is — don't regenerate it**), so the client's `Endpoint` and the server's public key never change — the Windows/phone config files don't need a single character edited:
+`--network host` lets the container operate directly on the host's network stack — the `wg0` interface, routing table, and `iptables` rules all take effect at the host level, which is the prerequisite for `ip rule` policy routing to work at all. The image doesn't depend on kernel version (userspace implementation), so DSM upgrades don't affect it.
+
+### Step 4: Router port forwarding
+
+Forward **UDP 51820** to the NAS's LAN IP.
+
+| Field | Value |
+|------|----|
+| Protocol | UDP |
+| External port | 51820 |
+| Internal IP | NAS's LAN IP |
+| Internal port | 51820 |
+
+---
+
+## Adding / removing clients
+
+There's no automation script for the server side (this part stays manual) — three steps per device:
+
+### Adding
+
+**1. Generate the client keypair and assign a VPN subnet IP** (`10.13.13.x`, incrementing from `.2` — `.1` is the server itself):
+
+```bash
+wg genkey | tee client_private.key | wg pubkey > client_public.key
+```
+
+**2. Append the `[Peer]` block to the server's `wg0.conf`**:
+
+```bash
+sudo tee -a /volume1/docker/wireguard/wg0.conf > /dev/null <<EOF
+
+# Client: <device name>
+[Peer]
+PublicKey  = <contents of client_public.key>
+AllowedIPs = 10.13.13.x/32
+EOF
+```
+
+**3. Hot-load it into the running container** (no container restart needed):
+
+```bash
+docker exec wireguard wg set wg0 peer <contents of client_public.key> allowed-ips 10.13.13.x/32
+```
+
+**4. Generate the client config file**:
 
 ```ini
 [Interface]
-PrivateKey = <original server private key, migrated as-is>
-Address    = 10.13.13.1/24
-ListenPort = 51820
-PostUp     = iptables -t nat -A POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule add from 10.13.13.0/24 lookup 100; ip route add default via 192.168.1.254 table 100
-PostDown   = iptables -t nat -D POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule del from 10.13.13.0/24 lookup 100 2>/dev/null || true; ip route del default via 192.168.1.254 table 100 2>/dev/null || true
+PrivateKey = <contents of client_private.key>
+Address    = 10.13.13.x/24
+DNS        = 8.8.8.8, 8.8.4.4
+MTU        = 1280
 
-# Client: work-macbook
 [Peer]
-PublicKey  = <client public key>
-AllowedIPs = 10.13.13.2/32
-
-# Client: iphone
-[Peer]
-PublicKey  = <client public key>
-AllowedIPs = 10.13.13.3/32
+PublicKey           = <contents of server_public.key>
+Endpoint            = <home public IP or domain>:51820
+AllowedIPs          = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
 ```
 
-Swap `eth0` for the NAS's actual physical interface name, and `192.168.1.254` for Surge Gateway Mode's actual virtual gateway address.
+Import methods:
 
-Update the router's port forward (UDP 51820) to point at the NAS's LAN IP — nothing else changes.
+| System | Method |
+|------|------|
+| macOS / Windows | Install the [WireGuard App](https://www.wireguard.com/install/), import the `.conf` file |
+| Linux | `sudo wg-quick up /path/to/xxx.conf` |
+| iOS / Android | Install the WireGuard App, generate a QR code with `qrencode -t ansiutf8 < xxx.conf` and scan it |
 
-### Verification
+> Don't share one config file across multiple devices — WireGuard identifies peers by private key, so multiple devices using the same config will fight over the connection and keep dropping. Generate a separate one per device.
+
+### Removing
 
 ```bash
-# Inside the container, check handshake state
-docker exec wireguard wg show
-# Should show a latest handshake and steadily growing transfer counters —
-# not just an endpoint with no handshake time
+# Remove from the running container (takes effect immediately)
+docker exec wireguard wg set wg0 peer <that device's public key> remove
 
-# On the host, confirm the outer handshake goes via the router, not Surge
-tcpdump -ni eth0 udp port 51820
-# The reply's source address should be the NAS's own LAN IP, and traffic should look like
-# dense, bidirectional, variably-sized packets (normal post-handshake data) —
-# not a lone 148-byte handshake-retry packet every 5 seconds (the classic sign of a stuck handshake)
-
-# On the client, confirm split-tunneling is active
-# Open ip.sb / ipinfo.io in the phone's browser — the exit IP should be a Surge proxy node's IP,
-# not the home's public IP
+# Manually delete the corresponding [Peer] block from wg0.conf, so it doesn't get reloaded on the next container restart
+sudo nano /volume1/docker/wireguard/wg0.conf
 ```
 
-### Seven key gotchas
-
-1. **Don't conflate "Surge intercepts WireGuard's replies" with "macOS pf's policy routing is unreliable in general"**: even on a completely clean Mac with no proxy software installed at all, testing `route-to`/`reply-to` on a locally-generated UDP reply still fails more often than not. Only after ruling out Surge/Clash entirely — falling back to the simplest baseline of "default gateway points straight at the router, no policy routing at all" — can you confirm the handshake path itself is sound. Pin down this baseline first, or you'll waste time repeatedly testing against the wrong assumption.
-
-2. **Any locally running TUN-mode proxy client intercepts the same-machine WireGuard server's replies — not just Surge**: before switching to a different Mac, check whether it also has a Clash-core proxy tool installed (`ps aux | grep -i clash`, or look for an extra `utun` interface carrying a `198.18.x.x`-style fake-IP address).
-
-3. **Verifying "who's actually handling this traffic" can't rely on which NIC saw the packet**: on the same LAN segment, a switch/router will sometimes let traffic show up on a machine's NIC that isn't actually processing the connection at all (visible in passing). You have to confirm via `wg show` that the machine genuinely has a handshake record and transfer stats — not just conclude from a `tcpdump` capture.
-
-4. **Surge/Clash's "Gateway Mode" requires the device to actually obtain its network config via its DHCP server — a runtime default-route change isn't enough**: commands like `route change default <virtual-gateway-IP>` often don't take effect reliably. You need to either manually configure the full TCP/IP settings (IP, subnet mask, gateway, DNS all explicit) in system network settings, or have the device redo DHCP so the proxy software's own DHCP server assigns it.
-
-5. **On macOS, `pf.conf` needs NAT rules and filter rules (`route-to`/`reply-to`/`pass`) declared under separate anchor types — `nat-anchor` and a plain `anchor` are two independent anchor points**: if only `nat-anchor "wireguard"` is declared, loading filter rules (like `route-to`) into the same-named anchor won't error, but also won't take effect at all — easy to misdiagnose as "the rule loaded but doesn't work" when actually the anchor declaration itself is incomplete.
-
-6. **pf's state table doesn't automatically invalidate just because a new rule was added**: if the client keeps retrying from the same source port, a newly added `route-to`/`reply-to` rule won't apply to the already-established connection state. You must run `pfctl -F states` to clear it, and have the client **fully disconnect and reconnect** (getting a fresh source port) to actually test whether the new rule works — otherwise you'll get a false-negative "added the rule but it still doesn't work."
-
-7. **TCP services are far less affected by pf's `route-to`/`reply-to` unreliability than UDP services are**: macOS pf's connection-state tracking is noticeably more reliable for TCP than for UDP. If you just need a local TCP service (e.g. a remote-desktop tool's WebSocket port) to bypass Surge/Clash's gateway takeover, `reply-to` will likely work reliably — no need to migrate to a Linux box the way WireGuard (UDP) required.
+Once removed, the device can no longer connect even if it still has the old `.conf` file.
 
 ---
 
 ## Windows client split-tunneling (company LAN local, everything else via home)
 
-Goal: once connected, traffic to the company LAN (printer, internal systems) should stay local, while everything else (including blocked sites) should route home through the tunnel.
+Goal: once connected, traffic to the company LAN (printer, internal systems) should stay local, while everything else (including blocked sites) should route home through the tunnel. This part is entirely **client-side** configuration — unrelated to which machine hosts the server. Now that the server has moved from the Mac to the NAS, none of Windows's configuration or routing scripts need to change at all.
 
 ### Why excluding a subnet via AllowedIPs doesn't work
 
@@ -432,7 +294,7 @@ Runs as `SYSTEM`, no UAC prompt. `EventID 10000/10001` (network connected/discon
 
 Symptom: some internal company systems only allow access from an internal IP; after connecting to the VPN, they return 403 or won't load at all.
 
-Cause: DNS queries also go through the tunnel to home. If the home Mac runs Surge in Enhanced Mode, DNS gets intercepted and returns one of Surge's virtual IPs (the `198.18.0.0/15` range), which the company server doesn't recognize.
+Cause: DNS queries also go through the tunnel to home. If a splitting tool (Surge/Clash) on the server's network has fake-ip enabled, DNS gets intercepted and returns a fake IP (something in the `198.18.0.0/15` range, say), which the company server doesn't recognize.
 
 Diagnose:
 
@@ -452,35 +314,102 @@ Also add that IP's subnet to the "manual routing" script above, so it routes loc
 
 ---
 
+## Verification
+
+After connecting, on the client:
+
+```bash
+# The exit IP should show your home public IP (or the splitting tool's proxy node IP, if inner traffic is being split)
+curl -4 https://ifconfig.me
+
+# Ping the VPN gateway
+ping 10.13.13.1
+
+# Ping an external host (verify forwarding and NAT)
+ping 8.8.8.8
+```
+
+Check connection status inside the server container:
+
+```bash
+docker exec wireguard wg show
+# Should show peer, handshake time, traffic stats — an endpoint with no "latest handshake"
+# means the handshake hasn't actually succeeded yet
+```
+
+On the host, confirm the outer handshake really goes direct and isn't being intercepted by a splitting tool:
+
+```bash
+tcpdump -ni eth0 udp port 51820
+# The reply's source address should be the NAS's own LAN IP; once the handshake succeeds you should
+# see dense, bidirectional, variably-sized packets — not a lone 148-byte handshake-retry packet
+# every 5 seconds (the classic sign of a stuck handshake)
+```
+
+---
+
+## How it works
+
+### WireGuard protocol
+
+- Built on **UDP**, low latency, NAT-traversal friendly
+- Fixed crypto suite: Curve25519 (key exchange) + ChaCha20-Poly1305 (encryption) + BLAKE2s (hashing)
+- No negotiation phase, so no room for "misconfiguration" — minimal attack surface
+- ~4000 lines of code, independently audited (Trail of Bits, 2019)
+- Merged into Linux kernel 5.6 in 2020; the userspace implementation `wireguard-go` used here doesn't depend on kernel version, which is exactly why it fits nicely inside a Docker container
+
+### TUN virtual interface
+
+`wg-quick up wg0` creates a virtual network interface on the system (usually literally called `wg0` on Linux, `utun*` on macOS). Outbound app traffic is routed to this virtual interface, encrypted by WireGuard, and sent out the real interface; incoming UDP packets are decrypted and written back to the virtual interface, transparent to upper-layer apps.
+
+### IP forwarding + NAT
+
+```bash
+sysctl -w net.ipv4.ip_forward=1   # Linux; macOS uses net.inet.ip.forwarding
+```
+
+By default the system only forwards packets destined for itself; enabling this lets the kernel forward "passing-through" packets. The client's VPN IP (`10.13.13.x`) is a private address the internet doesn't recognize, so a NAT rule rewrites the source address of outbound packets to the server's own IP:
+
+```
+Original packet: src=10.13.13.2    dst=8.8.8.8
+After NAT:       src=192.168.1.110 dst=8.8.8.8   ← what the internet sees
+Reply:           src=8.8.8.8       dst=192.168.1.110
+Restored:        src=8.8.8.8       dst=10.13.13.2 ← sent back to the client
+```
+
+On Linux this is `iptables -t nat -A POSTROUTING ... -j MASQUERADE`; the connection state table restores reply packets automatically.
+
+### Outer/inner split routing (policy routing)
+
+`ip rule` splits traffic into different routing tables by **source address**: WireGuard's own handshake/reply packets are sourced from the server's own IP, so they use the main routing table (the default gateway, straight out to the internet); the client's decrypted real traffic is sourced from `10.13.13.x`, which gets pulled out specifically by `ip rule from 10.13.13.0/24 lookup 100` and routed via whatever gateway table 100 points to (e.g. Surge's Gateway Mode virtual IP). The two paths are entirely independent and never affect each other.
+
+### MTU
+
+WireGuard encapsulation adds roughly 60 bytes of header overhead. The client config defaults to `MTU = 1280` (a conservative value) to prevent large packets from exceeding the physical NIC's MTU (1500) and being dropped. ICMP pings are small and unaffected; without an MTU setting, large TCP/HTTPS packets often produce the "ping works but web pages won't load" symptom.
+
+### Container persistence
+
+`--restart unless-stopped` makes Docker automatically bring the container back up after the NAS reboots; every time the container starts, `wg-quick` re-executes the policy routing and NAT rules in `PostUp` — no manual intervention needed.
+
+---
+
 ## Service management
 
-### Stop the service
-
 ```bash
-# Temporary stop (auto-resumes after Mac restart)
-sudo wg-quick down wg0
+# Stop
+docker stop wireguard
 
-# Full stop (disable auto-start + stop service)
-sudo wg-quick down wg0
-sudo launchctl unload -w /Library/LaunchDaemons/com.wireguard.wg0.plist
-```
+# Start
+docker start wireguard
 
-### Start the service
+# Restart (use this after changing the config, to re-run PostUp)
+docker restart wireguard
 
-```bash
-# Start immediately
-sudo wg-quick up wg0
+# View logs
+docker logs wireguard
 
-# Re-register auto-start (after a full stop)
-sudo launchctl load -w /Library/LaunchDaemons/com.wireguard.wg0.plist
-```
-
-### Check current status
-
-```bash
-sudo wg show
-# Output shown → running
-# "Unable to access interface" → stopped
+# Check current status
+docker exec wireguard wg show
 ```
 
 ---
@@ -489,20 +418,21 @@ sudo wg show
 
 ```bash
 # View VPN connection status and traffic stats
-sudo wg show
+docker exec wireguard wg show
 
 # Restart WireGuard
-sudo wg-quick down wg0 && sudo wg-quick up wg0
+docker restart wireguard
 
-# View logs
-tail -f /var/log/wireguard-wg0.log
-tail -f /var/log/wireguard-wg0.err
+# View container logs
+docker logs -f wireguard
 
-# Check whether pfctl NAT rules are active
-sudo pfctl -a wireguard -s nat
+# Check whether NAT / policy routing is active
+docker exec wireguard iptables -t nat -L POSTROUTING -n
+docker exec wireguard ip rule list
+docker exec wireguard ip route show table 100
 
-# Packet capture for debugging (port 51820 traffic)
-sudo tcpdump -ni en0 udp port 51820
+# Packet capture for debugging (run on the host, watch port 51820 traffic)
+tcpdump -ni eth0 udp port 51820
 ```
 
 ---
@@ -513,10 +443,10 @@ sudo tcpdump -ni en0 udp port 51820
 
 Check in order:
 
-1. **Is the server running?**: `sudo wg show` — output means it's running
-2. **Is port forwarding configured on the router?**: confirm UDP 51820 is forwarded to the Mac's LAN IP
-3. **Does DNS point to the right IP?**: `curl ifconfig.me` to check the current public IP against the domain's resolved address
-4. **Confirm traffic is arriving**: `sudo tcpdump -ni any udp port 51820`, reconnect the client, and check for output
+1. **Is the server running?**: `docker exec wireguard wg show` — output means it's running
+2. **Is port forwarding configured on the router?**: confirm UDP 51820 is forwarded to the server's LAN IP, and that the target IP is current (easy to forget updating the router after moving the deployment)
+3. **Is the public IP / DDNS correct?**: `curl -4 ifconfig.me` to check the current public IP against what the client's `Endpoint` domain resolves to
+4. **Confirm traffic is arriving**: `tcpdump -ni eth0 udp port 51820`, reconnect the client, and check for output — no output at all means the packet got dropped somewhere along the way (a restriction on the client's network, a router rule, etc.); output in only one direction means the server is replying but the client isn't receiving it (a NAT/firewall issue)
 
 ### Ping works but web pages won't load
 
@@ -528,100 +458,66 @@ Add this to the client's `[Interface]` section:
 MTU = 1280
 ```
 
-### Handshake fails when Surge Enhanced Mode is on
+### The server's network also runs Surge/Clash, and handshake packets get intercepted with the reply's source address rewritten to a fake IP
 
-WireGuard's reply source IP gets rewritten to `198.18.0.1` by Surge, and the client rejects it.
+See "Why the server lives on a NAS instead of directly on the Mac" above — if you insist on deploying the WireGuard server on the same machine that runs Surge/Clash, this problem is essentially unfixable at the configuration level. The only reliable solution is to move the server to a Linux device that doesn't run a TUN proxy (a NAS, a Raspberry Pi, etc.) and use `ip rule` for policy routing.
 
-Add this to Surge's config under `[General]`:
+### The server's network gateway is a soft router (OpenWrt-style), and the soft router also does transparent proxying
 
-```ini
-tun-excluded-routes = <work computer's IP range, e.g. 117.133.0.0/16>
-```
+This is a different category of problem from "the same host itself running a proxy client," and the risk is noticeably lower:
 
-### Mac still receives traffic after Windows disconnects the VPN
+- Tonight's actual failure was "**a UDP reply the local machine itself generated**" getting intercepted by that same machine's TUN proxy — a weakness of macOS's own `pf` mechanism.
+- A soft router acting as the **gateway** proxying "traffic passing through it" is a much more conventional setup (this is exactly the mode this doc's inner-traffic-via-Surge-Gateway-Mode uses, and it worked) — it just needs to **precisely exclude** the WireGuard server's own handshake/reply traffic (the server's own IP, UDP port 51820) from being intercepted.
 
-This is expected. The Windows WireGuard service (`WireGuardTunnel$work-macbook`) may keep running in the background after "Deactivate," and `PersistentKeepalive = 25` sends a keepalive packet every 25 seconds.
-Also, port 51820 is exposed publicly, so internet scanners will probe it randomly.
-WireGuard validates keys and drops invalid packets outright — this doesn't affect security.
-
-### wg-quick fails to start with `Line unrecognized`
-
-`wg0.conf`'s PostUp/PostDown used `\` line continuation, which wg-quick doesn't support for multi-line commands.
-Convert the command to a single line. See the format generated by `setup-server.sh`.
-
-### Interface detection picks up Surge's utun instead of the physical NIC
-
-`route -n get default` returns Surge's virtual interface when Surge Enhanced Mode is on.
-`setup-server.sh` now uses `networksetup -listallhardwareports` + `ipconfig getifaddr` to detect the physical NIC instead, avoiding this issue.
-
-### Can't reach other devices on the LAN after a reboot (VPN-to-LAN connectivity broken)
-
-**Symptom**: the WireGuard tunnel itself works fine (`ping 10.13.13.1` succeeds), but other devices on the server's LAN (e.g. `192.168.1.x`) are unreachable — everything worked before the reboot.
-
-**Cause**: macOS's BSD `sed` doesn't interpret `\n` in a replacement string as a newline, so `setup-server.sh` failed to write `nat-anchor "wireguard"` into `/etc/pf.conf`. Before the reboot, pf's in-memory state happened to still be active; after rebooting, macOS reinitializes pf from `/etc/pf.conf`, the anchor reference is missing, NAT no longer applies, the client's packet source address isn't rewritten, and the target device's reply gets lost via the default gateway.
-
-**Verify**:
+Most soft routers run on Linux/OpenWrt, and under the hood use `iptables`/`nftables` for traffic redirection — "exclude a specific port/IP from redirection" is a standard capability there, far more reliable than macOS's `pf`. Verify with the same method after deploying:
 
 ```bash
-# Empty output means the anchor reference is missing
-grep 'wireguard' /etc/pf.conf
+tcpdump -ni <server's physical interface> udp port 51820
+# The reply's source address should be the server's own genuine LAN IP,
+# not a virtual/proxy address rewritten by the soft router
 ```
 
-**Fix**:
+### The client still sends traffic to the server after disconnecting the VPN
+
+This is expected. The client's WireGuard service may keep running in the background after "Deactivate," and `PersistentKeepalive = 25` sends a keepalive packet every 25 seconds. Also, the server's port is exposed publicly, so internet scanners will probe it randomly. WireGuard validates keys and drops invalid packets outright — this doesn't affect security.
+
+### A specific site is intermittently unreachable: Surge's gateway-mode traffic doesn't get Fake-IP protection
+
+**Symptom**: The Mac itself (Surge Enhanced Mode) can reach a given site with no issues, but another device (e.g. a phone) whose traffic is forwarded in over WireGuard fails to reach the same site intermittently or persistently. A packet capture shows the DNS resolution returning a wrong/poisoned result.
+
+**Cause**: Surge's Fake-IP anti-pollution mechanism only protects traffic the Mac itself originates (Enhanced Mode) — for its own queries, Surge assigns a fake address locally without ever asking an external DNS server, so it's naturally immune to pollution. Traffic forwarded in through gateway mode (the inner client traffic described in the architecture diagram above) doesn't get this same protection — it falls back to real DNS resolution, and if the upstream resolver is poisoned/filtered for a given domain, lookups fail intermittently.
+
+Fixes that were tried and confirmed **ineffective** (they applied cleanly but didn't solve the problem — don't retry these):
+- `hijack-dns` with a wildcard (`hijack-dns = *:53, ...`)
+- Manually adding the forwarding device's subnet to `tun-included-routes`
+- `gateway-restricted-to-lan = false`
+- Enabling `include-all-networks` / `include-local-networks`
+
+**The fix that actually works**: Run a local DNS service (e.g. AdGuard Home), switch its **upstream to an encrypted resolver** (DoH/DoT, not a plain IP), and point the forwarding device's DNS **directly at this local DNS service, bypassing Surge's gateway mode entirely**. This is also why the phone's WireGuard client config should set `DNS =` to a self-hosted encrypted DNS service rather than Surge's gateway virtual IP.
+
+**A pitfall hit along the way**: We tried running Mihomo (Clash Meta) in TUN mode with `auto-route` on the NAS as a standalone Fake-IP layer that would forward to Surge. **It worked perfectly against self-simulated test traffic, but caused widespread outages the moment real forwarded traffic (connections from other devices) hit it** — every commonly used app stopped connecting. The routes `auto-route` installs send reply packets for real forwarded traffic down a different path than the traffic generated by local test simulations, so this class of failure can't be caught by testing from the host alone. If the NAS already has multiple custom routing tables (policy routing) in place, don't introduce a tool that auto-takes-over routing like this without a proper test environment.
+
+**A side discovery**: If the local DNS service is deployed via Docker with its port mapped to `0.0.0.0:53` (listening on all interfaces), then *any* network interface address on the host — not just its main LAN IP, but also the WireGuard tunnel's own gateway address — can query it directly, with no extra port-forwarding needed.
+
+---
+
+## Native Mac deployment (when you don't need Surge/Clash coexistence)
+
+If you don't need to coexist with a Surge/Clash splitting tool on the same machine (say, you only have one Mac at home running 24/7, with no additional splitting requirement), it's simpler to just run this repo's built-in scripts directly on the Mac:
 
 ```bash
-sudo cp /etc/pf.conf /etc/pf.conf.bak
-sudo sed -i '' 's|nat-anchor "com\.apple/\*"|nat-anchor "com.apple/*"\
-nat-anchor "wireguard"|' /etc/pf.conf
-
-# Reload the ruleset and rewrite the anchor rules
-sudo pfctl -f /etc/pf.conf
-echo 'nat on en0 inet from 10.13.13.0/24 to any -> (en0)' | sudo pfctl -a wireguard -f -
+sudo bash setup-server.sh                                 # initialize the server
+sudo bash add-client.sh <device name> <home public IP or domain>   # generate a client config
+sudo bash remove-client.sh <device name>                  # remove a client
 ```
 
-`setup-server.sh` has been fixed — re-running the script now fixes this in one shot.
-
-### `wg show wg0` / `add-client.sh` wrongly reports WireGuard as not running
-
-**Symptom**: WireGuard is clearly running fine (other devices can connect and handshake), yet `sudo wg show wg0` fails with `Unable to access interface: No such file or directory`, and `add-client.sh` reports "WireGuard is not currently running" when generating a new client — the new client's peer never gets hot-loaded.
-
-**Cause**: macOS has no native WireGuard kernel module, so `wg-quick` carries the tunnel over a generic `utun` interface (e.g. `utun4`). `wg0` is just an alias `wg-quick` keeps track of itself in `/var/run/wireguard/wg0.name`, used only by `wg-quick up`/`down` internally. The raw `wg` command doesn't understand that alias at all — it looks directly for `/var/run/wireguard/<interface-name>.sock`. Passing `wg0` makes it look for a nonexistent `wg0.sock`, while the real socket is named `utun4.sock`, so it always fails.
-
-**Verify**:
-
-```bash
-sudo wg show
-# Note the "interface: utunN" line, then query again with the real name
-sudo wg show utunN
-```
-
-**Fix**: `add-client.sh` now automatically reads `/var/run/wireguard/wg0.name` to resolve the real interface name before operating on it — no manual intervention needed. If you're on an older version of the script, hot-load the new peer manually:
-
-```bash
-cat /var/run/wireguard/wg0.name   # shows the real interface name, e.g. utun4
-sudo wg set utun4 peer <client public key> allowed-ips <client VPN IP>/32
-```
-
-### Can't find the generated client config in Finder / `ls` reports Permission denied
-
-**Cause**: earlier versions of `add-client.sh` generated client files under `$(brew --prefix)/etc/wireguard/clients/`, a `700` directory owned by root (to protect the server's private key). The logged-in user and Finder have no permission to enter it — the file isn't missing, it's just inaccessible.
-
-**Fix**: `add-client.sh` now generates client files in a `clients/` directory next to the script itself, and `chown`s them back to whichever user ran `sudo` — so they're accessible via Finder/AirDrop right away, no extra steps needed.
-
-If your client files were generated by an older version of the script and are still under `$(brew --prefix)/etc/wireguard/clients/`, copy them out with `sudo` first:
-
-```bash
-sudo cp $(brew --prefix)/etc/wireguard/clients/<client-name>/<client-name>.conf ~/Desktop/
-sudo chown $(whoami) ~/Desktop/<client-name>.conf
-# After AirDropping it
-rm ~/Desktop/<client-name>.conf
-```
+The scripts handle key generation, `pf` NAT rules, `LaunchDaemon` auto-start, and client config generation automatically. The underlying mechanism and gotchas are the same WireGuard fundamentals as the NAS approach above — the differences are macOS-specific bits (`pfctl`/`LaunchDaemon`), which the scripts already handle internally without manual intervention.
 
 ---
 
 ## Security notes
 
 - **Key files are not committed to Git**: `.gitignore` excludes `*.key` and the `clients/` directory — don't manually `git add` key files
-- **Server private key permissions 600**: stored in `$(brew --prefix)/etc/wireguard/`, readable only by root
+- **Server private key permissions 600**: whether it's `wg0.conf` on the NAS or `$(brew --prefix)/etc/wireguard/` on a Mac, it should only be readable by root/an administrator
 - **Client config file permissions 600**: keep it safe after generation — leaking it is equivalent to leaking the private key
-- **Rotate keys periodically**: re-running `add-client.sh` for the same client generates a new keypair, invalidating the old config
+- **Rotate keys periodically**: generating a fresh keypair for a device invalidates its old config

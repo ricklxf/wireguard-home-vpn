@@ -2,260 +2,100 @@
 
 # WireGuard Home VPN
 
-让公司电脑的所有流量经由家里的 macOS 出网。
+服务端跑在群晖 NAS（Docker）上，让公司电脑/手机的流量经由家里出网；同时家里的 Mac 上继续跑 Surge 全权分流，两者互不干扰。
 
 ## 架构
 
 ```
-公司电脑（客户端）
+公司电脑 / 手机（客户端）
     │
     │  WireGuard 加密隧道（UDP 51820）
     │
-家用路由器（端口映射 51820 → Mac）
+家用路由器（端口映射 51820 → NAS）
     │
-家里 Mac（服务端）
-    ├─ WireGuard 解密
-    ├─ IP 转发（net.inet.ip.forwarding）
-    ├─ pfctl NAT（替换源地址）
-    └─── 家用宽带 ─── 互联网
+群晖 NAS（服务端，Docker 容器 --network host）
+    ├─ wg0 接口解密，源地址 10.13.13.x
+    │
+    ├─ 外层：WireGuard 自己的握手/回包（源地址是 NAS 自己的 IP）
+    │   └─ 走主路由表默认网关 → 家用路由器 → 直连互联网
+    │
+    └─ 内层：客户端解密后的真实流量（源地址 10.13.13.x）
+        └─ ip rule 策略路由单独指向 → Mac 的 Surge 网关模式 → 按 Surge 规则分流出网
 ```
+
+外层（隧道本身）和内层（隧道里的真实流量）走两条完全独立的路径，互不干扰——这是这套方案能同时满足"VPN 稳定连得上"和"流量走 Surge 分流"的关键。
+
+## 为什么服务端选择 NAS，而不是直接跑在 Mac 上
+
+最直接的做法是让 WireGuard 直接跑在家里那台运行 Surge 的 Mac 上。这在只需要"客户端能连回家"时没问题，但一旦同时要求"Surge 继续完整接管这台 Mac 的所有流量"，就会变成：**同一台机器上，Surge 要全权接管默认路由，WireGuard 服务端进程又要精确绕开它**——这在 macOS 上被反复验证走不通：
+
+- Surge 的 `PROCESS-NAME`、`IN-PORT` 规则对 UDP 无效，命中数永远是 0
+- macOS 的 `pf` 策略路由（`route-to`/`reply-to`）即使完全没有代理软件干扰，用在"本机自己生成的 UDP 回包"这种场景上依然大概率失败——这是 macOS 这个 pf fork 本身策略路由能力偏弱，不是被代理软件抢流量导致的
+- 换一台"干净"的 Mac 也不行——只要那台机器自己开了任何 TUN 模式的代理客户端（Surge、Clash 内核等），都会拦截同机 WireGuard 的回包，这不是 Surge 独有的问题
+
+而 Linux 的 `ip rule` 天生具备可靠的策略路由能力，第一次测试就成功。群晖等 NAS 底层就是 Linux，用 Docker 跑一个用户态 WireGuard 镜像即可，不用额外买硬件。
+
+> 如果你的场景不需要"同一台机器上 Surge/Clash 全权接管 + WireGuard 共存"（比如家里就一台 Mac，且不跑常驻 TUN 代理），直接在 Mac 上用本仓库的 `setup-server.sh` 更省事，见文末「Mac 原生部署（无 Surge/Clash 共存需求时）」。
+
+### 没有群晖时的平替设备
+
+核心要求就两条：跑 Linux（有可靠的 `ip rule` 策略路由）、24 小时开机。满足这两条的设备都能替代群晖：
+
+| 设备 | 可行性 | 说明 |
+|---|---|---|
+| 软路由 / OpenWrt 路由器 | 最佳 | WireGuard 常有内核模块支持，性能最好；策略路由原生支持；本身就是网关，天然不存在"回包绕路"的问题 |
+| 树莓派 | 很好 | Pi Zero 2W（几十元到一百多）就够用；完整 Linux，`ip rule` 随便配；功耗极低，适合常年开机 |
+| 闲置 x86 小主机 | 好 | 装 Debian/Ubuntu，能力等同树莓派，性能更强 |
+| 群晖等 NAS | 很好 | 本文使用的方案，前提是已经有一台常年开机的 NAS |
+| 云服务器 VPS | 场景不符 | 技术上最省事，但出口 IP 是机房的，不是家里的，失去了"回家出网"的意义 |
+| Mac | 不适合与 Surge/Clash 共存 | 已反复验证 macOS pf 策略路由不可靠；只跑 WireGuard、不需要分流共存时可以用 |
+
+---
 
 ## 前置条件
 
-- 家里的 Mac：macOS 12+，已安装 [Homebrew](https://brew.sh)
-- 家用路由器：支持端口映射（port forwarding）
+- 一台 24 小时开机、支持 Docker 的 NAS 或 Linux 主机（本文以群晖 DSM 7.2 为例）
+- 家用路由器：支持端口映射
 - 家里有固定公网 IP（或已配置好 DDNS）
+- 如果 NAS 所在网络里有 Surge/Clash 这类分流工具、且希望内层流量也走它分流，需要该工具支持"网关模式"（作为局域网其他设备的网关），并记下它的虚拟网关 IP
 
 ---
 
-## 使用方法
+## 部署服务端
 
-### 第一步：在家里 Mac 上初始化服务端
+### 第一步：生成服务端密钥对
 
-```bash
-sudo bash setup-server.sh
-```
-
-脚本自动完成：
-
-1. 安装 `wireguard-tools`（通过 Homebrew）
-2. 生成服务端 Curve25519 密钥对，存储在 `$(brew --prefix)/etc/wireguard/`
-3. 自动检测物理出口网卡（排除 Surge 等软件产生的虚拟 utun 接口）
-4. 生成 `wg0.conf`，PostUp/PostDown 为单行命令（wg-quick 不支持 `\` 换行）
-5. 向 `/etc/pf.conf` 注册 `wireguard` anchor（首次运行自动备份原文件）
-6. 在 `/Library/LaunchDaemons/` 注册服务，开机自动启动
-
-### 第二步：在家用路由器上配置端口映射
-
-将 **UDP 51820** 端口转发到家里 Mac 的内网 IP。
-
-> 具体操作因路由器品牌而异，通常在「虚拟服务器」或「端口映射」菜单下设置。  
-> Mac 内网 IP 在系统设置 → 网络 里查看，或运行 `ipconfig getifaddr en0`。
-
-端口映射字段说明：
-
-| 字段 | 值 |
-|------|----|
-| 协议 | UDP |
-| 外部端口 | 51820 |
-| 内部 IP | Mac 的内网 IP |
-| 内部端口 | 51820 |
-
-### 第三步：生成公司电脑的客户端配置
+在 NAS 上（或任意能跑 `wg` 命令的机器上）：
 
 ```bash
-sudo bash add-client.sh work-macbook <家里的公网IP或域名>
+wg genkey | tee server_private.key | wg pubkey > server_public.key
 ```
 
-脚本自动完成：
-
-1. 生成客户端密钥对
-2. 分配 VPN 子网 IP（`10.13.13.x`，自动递增）
-3. 生成 `clients/work-macbook/work-macbook.conf`（含 `MTU = 1280`，避免大包被丢弃）——生成在脚本所在目录下，属主是执行 `sudo` 的那个用户而不是 root，Finder/AirDrop 不用额外操作就能直接访问
-4. 热更新运行中的 WireGuard（无需重启）
-5. 若已安装 `qrencode`，打印二维码供手机扫码导入
-
-### 第四步：在公司电脑上导入配置
-
-| 系统 | 方式 |
-|------|------|
-| macOS / Windows | 安装 [WireGuard App](https://www.wireguard.com/install/)，导入 `.conf` 文件 |
-| Linux | `sudo wg-quick up /path/to/work-macbook.conf` |
-| iOS / Android | 安装 WireGuard App，扫描二维码 |
-
-启用后，`AllowedIPs = 0.0.0.0/0, ::/0` 表示**全部流量**（IPv4 + IPv6）都经 VPN 隧道回家出网。
-
-### 删除客户端（设备丢失或不再使用时）
+### 第二步：写 `wg0.conf`
 
 ```bash
-sudo bash remove-client.sh work-macbook
+sudo mkdir -p /volume1/docker/wireguard
+sudo tee /volume1/docker/wireguard/wg0.conf > /dev/null <<'EOF'
+[Interface]
+PrivateKey = <server_private.key 的内容>
+Address    = 10.13.13.1/24
+ListenPort = 51820
+PostUp     = iptables -t nat -A POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule add from 10.13.13.0/24 lookup 100; ip route add default via 192.168.1.254 table 100
+PostDown   = iptables -t nat -D POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule del from 10.13.13.0/24 lookup 100 2>/dev/null || true; ip route del default via 192.168.1.254 table 100 2>/dev/null || true
+EOF
+sudo chmod 600 /volume1/docker/wireguard/wg0.conf
 ```
 
-脚本自动完成：
+- `eth0` 换成 NAS 实际的物理网卡名
+- `192.168.1.254` 换成 Surge/Clash 网关模式实际的虚拟网关地址；如果不需要内层流量分流，把 `ip rule`/`ip route` 那两条去掉，只留 `iptables` 那条 NAT 规则即可，等同于普通的 WireGuard 服务端
 
-1. 从运行中的 WireGuard 摘除该 peer（立即生效，无需重启）
-2. 从服务端 `wg0.conf` 里删除对应配置
-3. 删除本地保存的密钥和配置文件
+此时 `wg0.conf` 里还没有任何 `[Peer]`（客户端），见下面「添加客户端」。
 
-删除后即使设备上还留着旧的 `.conf` 文件，也无法再连接。
-
-> 不要一份配置文件给多台设备共用——WireGuard 按私钥识别 peer，多台设备用同一份配置会互相抢占连接，导致反复掉线。每台设备都应该单独用 `add-client.sh` 生成一份。
-
----
-
-## 验证
-
-连上 VPN 后，在公司电脑上：
+### 第三步：Docker 启动容器
 
 ```bash
-# 出口 IP 应该显示家里的公网 IP
-curl https://ifconfig.me
-
-# ping VPN 网关
-ping 10.13.13.1
-
-# ping 外网（验证转发和 NAT）
-ping 8.8.8.8
-```
-
-在服务端查看连接状态：
-
-```bash
-sudo wg show
-# 能看到 peer、握手时间、流量统计
-```
-
----
-
-## 原理说明
-
-### WireGuard 协议
-
-- 基于 **UDP**，延迟低，NAT 穿透友好
-- 加密套件固定：Curve25519（密钥交换）+ ChaCha20-Poly1305（加密）+ BLAKE2s（哈希）
-- 无协商过程，没有"配置错误"的空间，攻击面极小
-- 代码量约 4000 行，经过独立安全审计（2019 年 Trail of Bits）
-- 2020 年合并进 Linux 内核 5.6，macOS 上使用用户态的 `wireguard-go`
-
-### TUN 虚拟网卡
-
-`wg-quick up wg0` 在系统里创建一张虚拟网卡（macOS 上名为 `utun*`）。  
-应用发出的包经路由表送往 `utun*`，WireGuard 加密后从真实网卡发出；  
-收到的 UDP 包解密后写回 `utun*`，对上层应用透明。
-
-### IP 转发
-
-```bash
-sysctl -w net.inet.ip.forwarding=1
-```
-
-默认 macOS 只转发目标是本机的包，开启后内核会转发"路过的包"，  
-让公司电脑的流量能经由 Mac 送往互联网。
-
-### pfctl NAT
-
-公司电脑的 VPN IP（`10.13.13.x`）是私有地址，互联网不认识。  
-NAT 规则将出包的源地址替换为 Mac 自己的 IP：
-
-```
-原始包：src=10.13.13.2  dst=8.8.8.8
-经 NAT：src=192.168.1.4  dst=8.8.8.8   ← 互联网看到的
-回包：  src=8.8.8.8     dst=192.168.1.4
-还原：  src=8.8.8.8     dst=10.13.13.2 ← 送回给公司电脑
-```
-
-pfctl 通过连接状态表自动完成回包还原，无需手动干预。
-
-### MTU
-
-WireGuard 封装会增加约 60 字节的头部开销。  
-客户端配置默认设置 `MTU = 1280`（保守值），避免大包超出物理网卡 MTU（1500）被丢弃。  
-ICMP ping 包小，不受影响；TCP/HTTPS 的大包如不设置 MTU 容易出现"能 ping 通但无法浏览网页"的现象。
-
-### LaunchDaemon（开机自启）
-
-注册在 `/Library/LaunchDaemons/`，系统启动时以 root 身份运行，  
-用户未登录时也会自动拉起 WireGuard。
-
----
-
-## 与 Surge 的兼容性
-
-如果家里 Mac 同时运行了 Surge，需要额外配置，否则 WireGuard 响应包会被 Surge 劫持。
-
-### 问题原因
-
-Surge Enhanced Mode（增强模式）会接管系统路由表，所有出站流量都经过 Surge 的虚拟接口。  
-WireGuard 向公司电脑发回包时，包被 Surge 拦截，**源地址被替换为 Surge 的虚拟 IP（`198.18.0.1`）**，  
-公司电脑收到后认不出这个地址，握手失败。
-
-> `PROCESS-NAME,wireguard-go,DIRECT` 规则对 UDP 无效——Surge 处理 UDP 时无论规则是否 DIRECT，仍使用虚拟 IP 转发。
-
-### 解决方案
-
-在 Surge 配置文件的 `[General]` 中，将公司电脑所在的 IP 段加入 `tun-excluded-routes`：
-
-```ini
-[General]
-tun-excluded-routes = 117.133.0.0/16
-```
-
-这条配置让 Surge 对目标为该 IP 段的流量不走 TUN，WireGuard 的响应包直接从物理网卡（`en0`）发出，源地址正常。
-
-加载配置后在 Mac 上用 tcpdump 验证：
-
-```bash
-sudo tcpdump -ni en0 udp port 51820
-# 回包源地址应为 192.168.1.x，而非 198.18.0.1
-```
-
-### 各模式行为汇总
-
-| Surge 模式 | 不做额外配置 | 加 tun-excluded-routes |
-|-----------|------------|----------------------|
-| 仅系统代理 | ✅ 正常工作 | 不需要 |
-| 增强模式 | ❌ 回包源 IP 错误，握手失败 | ✅ 正常工作 |
-| 两者同时开启 | ❌ 同增强模式 | ✅ 正常工作 |
-
-> **注意**：`tun-excluded-routes` 是按目标 IP 排除，如果公司 IP 段变化需要手动更新。
-
----
-
-## 服务端搬到群晖 / Linux（当客户端 IP 不固定、又要保留 Surge 完整接管时）
-
-### 背景：`tun-excluded-routes` 方案的边界
-
-上一节的 `tun-excluded-routes` 方案能让 Windows 稳定连回家，前提是**客户端的公网 IP 落在一个提前配置好的固定网段里**（比如公司出口 117.133.0.0/16）。这个前提对手机不成立——手机在外面用流量或不同 WiFi，公网 IP 每次都不一样，没法用一份静态排除列表覆盖。
-
-而且如果要求"Surge 继续完整接管这台 Mac 的所有流量"（不是只排除 WireGuard 那一段），问题会变成：**同一台机器上，既要 Surge 全权接管默认路由，又要 WireGuard 的服务端进程精确绕开它**。这在 macOS 上被证明走不通：
-
-- **`PROCESS-NAME,wireguard-go,DIRECT`**：对 UDP 无效（Surge 处理 UDP 时不看这条规则，命中数永远是 0）
-- **`AND,((PROTOCOL,UDP),(IN-PORT,51820)),DIRECT`**：同样无效，Surge 的 Rule 引擎主要针对"进程主动发起连接"，不覆盖"本机监听端口被动回包"这种场景
-- **pf 的 `route-to`**：即使把包强制指定走物理网卡，Surge 依然能在更底层（很可能是 Network Extension 框架）截获并改写源地址——`route-to` 改变的是路由表层面的选路，Surge 的拦截根本不经过这一层判断
-- **换一台不跑 Surge/Clash 的 "干净" Mac**：如果那台机器本身也装了 Clash 内核的代理客户端（比如 OKZ）并开着 TUN 模式，会复现一模一样的问题——**任何在本机开 TUN 模式的代理客户端，都会拦截同机 WireGuard 服务端的回包**，这不是 Surge 独有的问题
-- **pf 的 `route-to`/`reply-to` 用在"本机自己生成的 UDP 回包"上，在完全没有代理软件干扰的 Mac 上单独测试依然大概率失败**——这是 macOS 这个 pf fork 本身策略路由能力偏弱的问题，不是被代理软件抢流量导致的
-
-### 能用的方案：Linux 的 `ip rule` 策略路由
-
-macOS 缺的这块能力，Linux 的 `ip rule` 天生就有，而且可靠：
-
-```bash
-# 只有源地址是 VPN 子网的流量，才走这张单独的路由表
-ip rule add from 10.13.13.0/24 lookup 100
-ip route add default via 192.168.1.254 table 100   # 192.168.1.254 是 Surge 网关模式的虚拟网关
-```
-
-WireGuard 自己生成的握手/回包（源地址是本机 IP，不是 `10.13.13.x`）根本不会匹配这条规则，天然走主路由表的默认网关（家用路由器），不经过 Surge；只有客户端解密后的真实流量（源地址是 `10.13.13.x`）会被单独拎出来送进 Surge 网关。两层互不干扰，第一次测试就成功，跟 macOS 上折腾一整晚形成鲜明对比。
-
-### 部署方式：Docker 容器 + `--network host`
-
-不需要专门装 Linux，群晖这类 NAS（DSM 底层是 Linux）用 Docker 就能跑：
-
-```bash
-# 拉取用户态 WireGuard 镜像（不依赖内核版本，DSM 升级也不受影响）
 docker pull masipcat/wireguard-go:latest
 
-# 用 --network host 让容器直接操作宿主机的网络栈（wg0 接口、路由表、iptables 都在宿主机层面生效）
 docker run -d \
   --name wireguard \
   --network host \
@@ -267,68 +107,94 @@ docker run -d \
   masipcat/wireguard-go:latest
 ```
 
-`wg0.conf` 沿用原来 Mac 服务端的私钥和已注册的 peer（**私钥原样迁移，不要重新生成**），这样客户端的 `Endpoint`、服务端公钥都不用变，Windows/手机的配置文件一个字都不用改：
+`--network host` 让容器直接操作宿主机的网络栈——`wg0` 接口、路由表、`iptables` 规则都在宿主机层面生效，这也是 `ip rule` 策略路由能生效的前提。镜像不依赖内核版本（用户态实现），DSM 升级不受影响。
+
+### 第四步：路由器端口映射
+
+将 **UDP 51820** 端口转发到 NAS 的内网 IP。
+
+| 字段 | 值 |
+|------|----|
+| 协议 | UDP |
+| 外部端口 | 51820 |
+| 内部 IP | NAS 的内网 IP |
+| 内部端口 | 51820 |
+
+---
+
+## 添加 / 删除客户端
+
+服务端没有自动化脚本（这块沿用手动流程），每台设备三步：
+
+### 添加
+
+**1. 生成客户端密钥对、分配 VPN 子网 IP**（`10.13.13.x`，从 `.2` 开始递增，`.1` 是服务端自己）：
+
+```bash
+wg genkey | tee client_private.key | wg pubkey > client_public.key
+```
+
+**2. 把 `[Peer]` 追加进服务端 `wg0.conf`**：
+
+```bash
+sudo tee -a /volume1/docker/wireguard/wg0.conf > /dev/null <<EOF
+
+# Client: <设备名>
+[Peer]
+PublicKey  = <client_public.key 的内容>
+AllowedIPs = 10.13.13.x/32
+EOF
+```
+
+**3. 热加载到运行中的容器**（不用重启容器）：
+
+```bash
+docker exec wireguard wg set wg0 peer <client_public.key 的内容> allowed-ips 10.13.13.x/32
+```
+
+**4. 生成客户端配置文件**：
 
 ```ini
 [Interface]
-PrivateKey = <原服务端私钥，原样迁移>
-Address    = 10.13.13.1/24
-ListenPort = 51820
-PostUp     = iptables -t nat -A POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule add from 10.13.13.0/24 lookup 100; ip route add default via 192.168.1.254 table 100
-PostDown   = iptables -t nat -D POSTROUTING -s 10.13.13.0/24 -o eth0 -j MASQUERADE; ip rule del from 10.13.13.0/24 lookup 100 2>/dev/null || true; ip route del default via 192.168.1.254 table 100 2>/dev/null || true
+PrivateKey = <client_private.key 的内容>
+Address    = 10.13.13.x/24
+DNS        = 8.8.8.8, 8.8.4.4
+MTU        = 1280
 
-# Client: work-macbook
 [Peer]
-PublicKey  = <客户端公钥>
-AllowedIPs = 10.13.13.2/32
-
-# Client: iphone
-[Peer]
-PublicKey  = <客户端公钥>
-AllowedIPs = 10.13.13.3/32
+PublicKey           = <server_public.key 的内容>
+Endpoint            = <家里公网IP或域名>:51820
+AllowedIPs          = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
 ```
 
-`eth0` 换成 NAS 实际的物理网卡名，`192.168.1.254` 换成 Surge 网关模式实际的虚拟网关地址。
+导入方式：
 
-路由器的端口映射（UDP 51820）目标 IP 改成 NAS 的内网 IP，其余不变。
+| 系统 | 方式 |
+|------|------|
+| macOS / Windows | 安装 [WireGuard App](https://www.wireguard.com/install/)，导入 `.conf` 文件 |
+| Linux | `sudo wg-quick up /path/to/xxx.conf` |
+| iOS / Android | 安装 WireGuard App，用 `qrencode -t ansiutf8 < xxx.conf` 生成二维码扫码导入 |
 
-### 验证
+> 不要一份配置文件给多台设备共用——WireGuard 按私钥识别 peer，多台设备用同一份配置会互相抢占连接，导致反复掉线。每台设备都单独生成一份。
+
+### 删除
 
 ```bash
-# 容器内查看握手状态
-docker exec wireguard wg show
-# 应该能看到 latest handshake 和持续增长的 transfer 数据，不是只有 endpoint 没有握手时间
+# 从运行中的容器摘除（立即生效）
+docker exec wireguard wg set wg0 peer <该设备的公钥> remove
 
-# 宿主机上抓包确认外层握手走的是路由器，不是 Surge
-tcpdump -ni eth0 udp port 51820
-# 回包源地址应该是 NAS 自己的内网 IP，且行为应该是密集的双向小包（握手完成后的正常数据），
-# 不是每 5 秒一次孤零零的 148 字节握手重试包（那是握手一直没成功的典型症状）
-
-# 客户端侧确认分流生效
-# 手机浏览器打开 ip.sb / ipinfo.io，出口 IP 应该是 Surge 代理节点的 IP，不是家里的公网 IP
+# 从 wg0.conf 里手动删掉对应的 [Peer] 块，防止容器重启后又加载回来
+sudo nano /volume1/docker/wireguard/wg0.conf
 ```
 
-### 七个关键坑
-
-1. **不要把"Surge 拦截 WireGuard 回包"和"macOS pf 策略路由本身不可靠"当成一回事**：即使换到一台完全没装任何代理软件的干净 Mac，本机自己生成的 UDP 回包用 `route-to`/`reply-to` 单独测试依然大概率失败。只有排除掉 Surge/Clash 这些因素，回到最简单的"默认网关直接指向路由器、不做任何策略路由"，才能确认握手链路本身没问题——这是必须先钉死的 baseline，否则会在错误的假设上反复浪费时间。
-
-2. **任何在本机开 TUN 模式的代理客户端都会拦截同机 WireGuard 的回包，不只是 Surge**：换到另一台 Mac 之前，先确认那台机器上是否也装了 Clash 内核之类的代理工具（`ps aux | grep -i clash` 或查看是否有额外的 `utun` 接口带着 `198.18.x.x` 这种 fake-ip 网段的地址）。
-
-3. **验证"流量到底被谁处理"，不能只看包在哪块网卡上出现过**：同一局域网段内，交换机/路由器有时候会让流量在"没有实际处理这个连接"的机器网卡上也被抓到（顺路可见），必须用 `wg show` 确认该机器上有没有真实的握手记录和流量统计，而不是靠 `tcpdump` 抓到包就下结论。
-
-4. **Surge/Clash 的"网关模式"要求设备真的通过它的 DHCP 获取网络配置，不能只是运行时改一下默认路由**：用 `route change default <虚拟网关IP>` 这种命令行操作往往不会真正生效或不稳定，必须在系统网络设置里手动配置完整的 TCP/IP（IP、子网掩码、网关、DNS 全部指定），或者让设备重新走一次 DHCP 由代理软件的 DHCP 服务器分配。
-
-5. **macOS 的 `pf.conf` 里，NAT 规则和过滤规则（`route-to`/`reply-to`/`pass`）需要分别声明 `nat-anchor` 和普通 `anchor`，二者是两套独立的锚点**：只声明了 `nat-anchor "wireguard"` 时，往同名 anchor 里加载过滤规则（比如 `route-to`）不会报错，但也根本不会生效，容易误判"规则加了但没用"，其实是锚点声明本身就不完整。
-
-6. **`pf` 的状态表（state table）不会因为新加了规则就自动失效**：如果客户端一直在用同一个源端口反复重试连接，新加的 `route-to`/`reply-to` 规则对已经建立的连接状态不生效，必须 `pfctl -F states` 清空状态表，并且让客户端**完全断开重连**（换一个新的源端口）才能验证新规则是否真的起作用，否则会得到"规则加了但还是不行"的假阴性结论。
-
-7. **TCP 服务受 pf `route-to`/`reply-to` 不稳定的影响，比 UDP 服务小得多**：macOS pf 对 TCP 的连接状态追踪明显比 UDP 可靠，如果只是让某个本机 TCP 服务（比如远程桌面工具的 WebSocket 端口）绕开 Surge/Clash 的网关接管，`reply-to` 大概率能稳定生效，不需要像 WireGuard（UDP）这样被迫换到 Linux 设备。
+删除后即使设备上还留着旧的 `.conf` 文件，也无法再连接。
 
 ---
 
 ## Windows 客户端分流方案（内网走公司，外网走家里）
 
-需求：公司电脑连 VPN 后，访问公司内网（打印机、内网系统）走公司本地网络，其余流量（含被墙网站）经家里出网。
+需求：公司电脑连 VPN 后，访问公司内网（打印机、内网系统）走公司本地网络，其余流量（含被墙网站）经家里出网。这部分是**客户端侧**的配置，跟服务端具体跑在哪台机器上无关，服务端从 Mac 搬到 NAS 之后，Windows 这边的配置和路由脚本完全不用改。
 
 ### 为什么不能靠 AllowedIPs 排除网段
 
@@ -428,7 +294,7 @@ Register-ScheduledTask -TaskName "WireGuard-Routes" -Action $action -Trigger @($
 
 现象：公司某些系统只允许内网 IP 访问，连 VPN 后打开报 403 或直接打不开。
 
-原因：DNS 查询也会经隧道到家里，如果家里 Mac 跑了 Surge 增强模式，DNS 会被拦截返回 Surge 的虚拟 IP（`198.18.0.0/15` 段），公司服务器不认这个假 IP。
+原因：DNS 查询也会经隧道到家里，如果服务端所在网络里的分流工具（Surge/Clash）开着 fake-ip，DNS 会被拦截返回假 IP（`198.18.0.0/15` 段之类），公司服务器不认这个假 IP。
 
 排查：
 
@@ -448,35 +314,100 @@ echo <真实IP> <域名> >> C:\Windows\System32\drivers\etc\hosts
 
 ---
 
+## 验证
+
+连上 VPN 后，在客户端上：
+
+```bash
+# 出口 IP 应该显示家里的公网 IP（如果内层流量走了分流工具的代理节点，会显示节点的 IP）
+curl -4 https://ifconfig.me
+
+# ping VPN 网关
+ping 10.13.13.1
+
+# ping 外网（验证转发和 NAT）
+ping 8.8.8.8
+```
+
+在服务端容器里查看连接状态：
+
+```bash
+docker exec wireguard wg show
+# 能看到 peer、握手时间、流量统计——只有 endpoint 没有 "latest handshake" 说明还没握手成功
+```
+
+宿主机抓包确认外层握手确实走了直连而不是被分流工具拦截：
+
+```bash
+tcpdump -ni eth0 udp port 51820
+# 回包源地址应该是 NAS 自己的内网 IP；握手成功后应能看到密集的双向不定长数据包，
+# 而不是每 5 秒一次孤零零的 148 字节握手重试包（后者是握手一直没成功的典型症状）
+```
+
+---
+
+## 原理说明
+
+### WireGuard 协议
+
+- 基于 **UDP**，延迟低，NAT 穿透友好
+- 加密套件固定：Curve25519（密钥交换）+ ChaCha20-Poly1305（加密）+ BLAKE2s（哈希）
+- 无协商过程，没有"配置错误"的空间，攻击面极小
+- 代码量约 4000 行，经过独立安全审计（2019 年 Trail of Bits）
+- 2020 年合并进 Linux 内核 5.6；本方案用的用户态实现 `wireguard-go` 不依赖内核版本，适合跑在 Docker 容器里
+
+### TUN 虚拟网卡
+
+`wg-quick up wg0` 在系统里创建一张虚拟网卡（Linux 上通常直接叫 `wg0`，macOS 上是 `utun*`）。应用发出的包经路由表送往这张虚拟网卡，WireGuard 加密后从真实网卡发出；收到的 UDP 包解密后写回虚拟网卡，对上层应用透明。
+
+### IP 转发 + NAT
+
+```bash
+sysctl -w net.ipv4.ip_forward=1   # Linux；macOS 是 net.inet.ip.forwarding
+```
+
+默认系统只转发目标是本机的包，开启后内核会转发"路过的包"。客户端的 VPN IP（`10.13.13.x`）是私有地址，互联网不认识，NAT 规则把出包的源地址替换成服务端自己的 IP：
+
+```
+原始包：src=10.13.13.2  dst=8.8.8.8
+经 NAT：src=192.168.1.110  dst=8.8.8.8   ← 互联网看到的
+回包：  src=8.8.8.8       dst=192.168.1.110
+还原：  src=8.8.8.8       dst=10.13.13.2 ← 送回给客户端
+```
+
+Linux 上用 `iptables -t nat -A POSTROUTING ... -j MASQUERADE` 实现，连接状态表自动完成回包还原。
+
+### 内外分层路由（策略路由）
+
+`ip rule` 按**源地址**把流量分流到不同的路由表：WireGuard 自己生成的握手/回包源地址是服务端本机 IP，走主路由表（默认网关，直连出网）；客户端解密后的真实流量源地址是 `10.13.13.x`，被单独的 `ip rule from 10.13.13.0/24 lookup 100` 拦下，走 table 100 里配置的网关（比如 Surge 的网关模式虚拟 IP）。两条路径完全独立，互不影响。
+
+### MTU
+
+WireGuard 封装会增加约 60 字节的头部开销。客户端配置默认设置 `MTU = 1280`（保守值），避免大包超出物理网卡 MTU（1500）被丢弃。ICMP ping 包小，不受影响；TCP/HTTPS 的大包如不设置 MTU 容易出现"能 ping 通但无法浏览网页"的现象。
+
+### 容器持久化
+
+`--restart unless-stopped` 让 Docker 在 NAS 重启后自动拉起容器；容器内 `wg-quick` 每次启动都会重新执行 `PostUp` 里的策略路由和 NAT 规则，不依赖任何手动干预。
+
+---
+
 ## 服务管理
 
-### 停止服务
-
 ```bash
-# 临时关闭（重启 Mac 后自动恢复）
-sudo wg-quick down wg0
+# 停止
+docker stop wireguard
 
-# 彻底关闭（取消开机自启 + 停止服务）
-sudo wg-quick down wg0
-sudo launchctl unload -w /Library/LaunchDaemons/com.wireguard.wg0.plist
-```
+# 启动
+docker start wireguard
 
-### 启动服务
+# 重启（配置改了之后用这个让 PostUp 重新执行）
+docker restart wireguard
 
-```bash
-# 立即启动
-sudo wg-quick up wg0
+# 查看日志
+docker logs wireguard
 
-# 重新注册开机自启（彻底关闭后恢复用）
-sudo launchctl load -w /Library/LaunchDaemons/com.wireguard.wg0.plist
-```
-
-### 确认当前状态
-
-```bash
-sudo wg show
-# 有输出 → 运行中
-# 提示 "Unable to access interface" → 已停止
+# 确认当前状态
+docker exec wireguard wg show
 ```
 
 ---
@@ -485,20 +416,21 @@ sudo wg show
 
 ```bash
 # 查看 VPN 连接状态及流量统计
-sudo wg show
+docker exec wireguard wg show
 
 # 重启 WireGuard
-sudo wg-quick down wg0 && sudo wg-quick up wg0
+docker restart wireguard
 
-# 查看日志
-tail -f /var/log/wireguard-wg0.log
-tail -f /var/log/wireguard-wg0.err
+# 查看容器日志
+docker logs -f wireguard
 
-# 查看 pfctl NAT 规则是否生效
-sudo pfctl -a wireguard -s nat
+# 查看 NAT / 策略路由是否生效
+docker exec wireguard iptables -t nat -L POSTROUTING -n
+docker exec wireguard ip rule list
+docker exec wireguard ip route show table 100
 
-# 抓包调试（看 51820 端口流量）
-sudo tcpdump -ni en0 udp port 51820
+# 抓包调试（宿主机上跑，看 51820 端口流量）
+tcpdump -ni eth0 udp port 51820
 ```
 
 ---
@@ -509,10 +441,10 @@ sudo tcpdump -ni en0 udp port 51820
 
 按顺序检查：
 
-1. **服务端是否在运行**：`sudo wg show`，有输出说明在运行
-2. **路由器端口映射是否配置**：确认 UDP 51820 已转发到 Mac 内网 IP
-3. **DNS 是否指向正确 IP**：`curl ifconfig.me` 查看当前公网 IP，与域名解析结果对比
-4. **抓包确认流量是否到达**：`sudo tcpdump -ni any udp port 51820`，让客户端重连，看有无输出
+1. **服务端是否在运行**：`docker exec wireguard wg show`，有输出说明在运行
+2. **路由器端口映射是否配置**：确认 UDP 51820 已转发到服务端的内网 IP，且目标 IP 是最新的（改过部署位置后容易忘记同步改路由器）
+3. **公网 IP / DDNS 是否正确**：`curl -4 ifconfig.me` 查看当前公网 IP，与客户端 `Endpoint` 填的域名解析结果对比
+4. **抓包确认流量是否到达**：`tcpdump -ni eth0 udp port 51820`，让客户端重连，看有无输出——完全没有输出说明包在半路就被丢了（客户端所在网络限制、路由器规则等），有输出但只有单向说明服务端有回应但客户端收不到（NAT/防火墙问题）
 
 ### 能 ping 通但网页打不开
 
@@ -524,100 +456,65 @@ sudo tcpdump -ni en0 udp port 51820
 MTU = 1280
 ```
 
-### Surge 开启增强模式时握手失败
+### 服务端所在网络也跑着 Surge/Clash，握手包被拦截、回包源地址变成假 IP
 
-WireGuard 回包源 IP 被 Surge 替换为 `198.18.0.1`，客户端拒绝。
+详见上面「为什么服务端选择 NAS，而不是直接跑在 Mac 上」——如果坚持要在同一台跑 Surge/Clash 的机器上部署 WireGuard 服务端，这个问题基本无法从配置层面根治，唯一可靠的解法是把服务端搬到一台不跑 TUN 代理的 Linux 设备（NAS、树莓派等），用 `ip rule` 做策略路由。
 
-在 Surge 配置的 `[General]` 中加入：
+### 服务端所在网络的网关是软路由（OpenWrt 之类），软路由里也有透明代理
 
-```ini
-tun-excluded-routes = <公司电脑IP段，如 117.133.0.0/16>
-```
+跟"同一台主机自己跑代理客户端"不是同一类问题，风险明显更低：
 
-### Windows 关闭 VPN 后 Mac 仍收到流量
+- 今晚踩的坑是"**本机自己生成的 UDP 回包**被本机的 TUN 代理拦截"——这是 macOS `pf` 机制本身的缺陷
+- 软路由作为**网关**代理"经过它的流量"是更常规的场景（本文内层流量走 Surge 网关模式就是这个模式，而且成功了），只要软路由能**精确排除** WireGuard 服务端自己的握手/回包（服务端自己的 IP、UDP 51820 端口）不被拦截即可
 
-正常现象。Windows WireGuard 服务（`WireGuardTunnel$work-macbook`）在"Deactivate"后可能仍在后台运行，`PersistentKeepalive = 25` 会每 25 秒发一个保活包。  
-此外端口 51820 暴露在公网，互联网扫描器也会随机探测。  
-WireGuard 会验证密钥，无效包直接丢弃，不影响安全。
-
-### wg-quick 启动报 `Line unrecognized`
-
-`wg0.conf` 中 PostUp/PostDown 使用了 `\` 换行，wg-quick 不支持多行。  
-需将命令改为单行。参考 `setup-server.sh` 生成的格式。
-
-### 接口检测到 Surge 的 utun 而非物理网卡
-
-`route -n get default` 在 Surge Enhanced Mode 开启时返回 Surge 的虚拟接口。  
-`setup-server.sh` 已改用 `networksetup -listallhardwareports` + `ipconfig getifaddr` 检测物理网卡，避免此问题。
-
-### 重启后无法访问局域网内其他设备（VPN 内网互通失败）
-
-**现象**：WireGuard 隧道正常（`ping 10.13.13.1` 通），但无法访问服务端同一局域网内的其他设备（如 `192.168.1.x`），重启前一切正常。
-
-**原因**：macOS BSD `sed` 在替换字符串中不把 `\n` 解析为换行符，导致 `setup-server.sh` 未能将 `nat-anchor "wireguard"` 写入 `/etc/pf.conf`。重启前 pf 的内存状态恰好生效；重启后 macOS 用 `/etc/pf.conf` 重新初始化 pf，anchor 引用缺失，NAT 不再生效，来自客户端的包源地址未被替换，目标设备的回包走默认网关后丢失。
-
-**验证**：
+多数软路由跑在 Linux/OpenWrt 上，底层用 `iptables`/`nftables` 做流量重定向，"排除特定端口/IP 不重定向"是标准能力，可靠性远高于 macOS 的 `pf`。部署完用同一套方法验证：
 
 ```bash
-# 如果输出为空，说明 anchor 引用缺失
-grep 'wireguard' /etc/pf.conf
+tcpdump -ni <服务端物理网卡> udp port 51820
+# 回包源地址应该是服务端自己真实的内网 IP，不是被软路由改写成的虚拟/代理地址
 ```
 
-**修复**：
+### 客户端断开 VPN 后服务端仍收到流量
+
+正常现象。客户端的 WireGuard 服务在"Deactivate"后可能仍在后台运行，`PersistentKeepalive = 25` 会每 25 秒发一个保活包。此外服务端端口暴露在公网，互联网扫描器也会随机探测。WireGuard 会验证密钥，无效包直接丢弃，不影响安全。
+
+### 特定网站间歇性打不开：Surge 网关模式转发流量拿不到假 IP 保护
+
+**现象**：Mac 本机（Surge Enhanced Mode）访问某网站完全正常，但手机等经 WireGuard 转发进来的设备访问同一网站却间歇性/持续打不开，抓包看是 DNS 解析拿到了错误/被污染的结果。
+
+**原因**：Surge 的 Fake-IP 抗污染机制只保护"本机自己发起的流量"——本机查询时直接在本地分配一个假地址，不用真的问外部 DNS，天然不会被污染。但"网关模式转发进来的流量"（内层客户端流量，见前面架构图）不会套用这层保护，会退回到真实 DNS 解析，如果上游对特定域名有污染/过滤，就会间歇性失败。
+
+已验证**无效**的修复方向（配置本身生效了，但没解决问题，不用再重复尝试）：
+- `hijack-dns` 加通配符（`hijack-dns = *:53, ...`）
+- `tun-included-routes` 手动纳入转发设备所在网段
+- `gateway-restricted-to-lan = false`
+- `include-all-networks` / `include-local-networks` 打开
+
+**真正有效的修复**：部署本地 DNS 服务（如 AdGuard Home），把它的**上游 DNS 换成加密的**（DoH/DoT，而不是明文 IP），让客户端设备的 DNS **直接指向这台本地 DNS 服务，绕开 Surge 网关模式这一层**。这也是为什么手机 WireGuard 客户端配置里的 `DNS =` 不建议指向 Surge 网关虚拟 IP，而应指向自建的加密 DNS 服务。
+
+**踩过的坑**：曾尝试用 Mihomo（Clash Meta）的 TUN + `auto-route` 在 NAS 上单独实现一层假 IP 保护、转发给 Surge 处理。**在自己模拟的测试流量上完全正常，一接入真实转发流量（其他设备发起的连接）就导致大范围断网**（用到的常见 App 全部连不上）——`auto-route` 生成的路由规则，会让真实转发流量的应答包走上跟本机测试流量不一样的路径，这类问题没法靠本机模拟测试提前发现。NAS 已有多张自定义路由表（策略路由）时，不建议在没有充分测试环境的情况下贸然引入这类会自动接管路由的工具。
+
+**顺带发现**：如果本地 DNS 服务是用 Docker 部署、且端口映射是 `0.0.0.0:53`（监听所有网卡），那么宿主机拥有的**任意一个网络接口地址**（不只是主局域网 IP，包括 WireGuard 隧道自己的网关地址）都能直接查到它，不需要额外配置端口转发。
+
+---
+
+## Mac 原生部署（无 Surge/Clash 共存需求时）
+
+如果不需要跟同机的 Surge/Clash 分流工具共存（比如家里只有一台 Mac 常年开机，没有额外的分流需求），可以直接用本仓库自带的脚本在 Mac 上跑，更省事：
 
 ```bash
-sudo cp /etc/pf.conf /etc/pf.conf.bak
-sudo sed -i '' 's|nat-anchor "com\.apple/\*"|nat-anchor "com.apple/*"\
-nat-anchor "wireguard"|' /etc/pf.conf
-
-# 重载规则集并重新写入 anchor 规则
-sudo pfctl -f /etc/pf.conf
-echo 'nat on en0 inet from 10.13.13.0/24 to any -> (en0)' | sudo pfctl -a wireguard -f -
+sudo bash setup-server.sh                              # 初始化服务端
+sudo bash add-client.sh <设备名> <家里公网IP或域名>       # 生成客户端配置
+sudo bash remove-client.sh <设备名>                      # 删除客户端
 ```
 
-`setup-server.sh` 已修复此 bug，重新运行脚本可一次性修复。
-
-### `wg show wg0` / `add-client.sh` 误判 WireGuard 未运行
-
-**现象**：明明 WireGuard 正常在跑（其他设备能连、能握手），但 `sudo wg show wg0` 报 `Unable to access interface: No such file or directory`，`add-client.sh` 生成新客户端时提示"WireGuard 当前未运行"，新客户端的 peer 没有被热加载。
-
-**原因**：macOS 没有原生 WireGuard 内核模块，`wg-quick` 用通用的 `utun` 接口（如 `utun4`）承载隧道，`wg0`只是`wg-quick`自己在 `/var/run/wireguard/wg0.name` 里记的一个别名，仅供 `wg-quick up/down` 自己使用。原始的 `wg` 命令并不认这个别名，它直接找 `/var/run/wireguard/<接口名>.sock`——传入 `wg0` 时找的是不存在的 `wg0.sock`，而实际的 socket 叫 `utun4.sock`，所以必然报错。
-
-**验证**：
-
-```bash
-sudo wg show
-# 看 "interface: utunN" 这一行，用真实名字重新查
-sudo wg show utunN
-```
-
-**修复**：`add-client.sh` 已改为自动读取 `/var/run/wireguard/wg0.name` 解析出真实接口名再操作，无需手动干预。若使用旧版脚本，手动热加载新 peer：
-
-```bash
-cat /var/run/wireguard/wg0.name   # 查看真实接口名，如 utun4
-sudo wg set utun4 peer <客户端公钥> allowed-ips <客户端VPN IP>/32
-```
-
-### 生成的客户端配置文件在 Finder 里找不到 / `ls` 报 Permission denied
-
-**原因**：早期版本的 `add-client.sh` 把客户端文件生成在 `$(brew --prefix)/etc/wireguard/clients/` 下，这个目录权限是 `700`、属主是 root（保护服务端私钥），当前登录用户和 Finder 都没权限进入，不是文件不存在。
-
-**修复**：`add-client.sh` 已改为把客户端文件生成在脚本所在目录下的 `clients/`，并 `chown` 回执行 `sudo` 的那个用户，生成后可以直接用 Finder/AirDrop 访问，无需额外操作。
-
-若你的客户端文件是用旧版脚本生成、还留在 `$(brew --prefix)/etc/wireguard/clients/` 下，用 `sudo` 复制出来再传输：
-
-```bash
-sudo cp $(brew --prefix)/etc/wireguard/clients/<客户端名>/<客户端名>.conf ~/Desktop/
-sudo chown $(whoami) ~/Desktop/<客户端名>.conf
-# AirDrop 传完后
-rm ~/Desktop/<客户端名>.conf
-```
+脚本自动处理密钥生成、`pf` NAT 规则、`LaunchDaemon` 开机自启、客户端配置生成。原理和踩坑跟上面的 NAS 方案是同一套 WireGuard 机制，差异主要在 macOS 特有的 `pfctl`/`LaunchDaemon`，脚本内部已经处理，不需要手动干预。
 
 ---
 
 ## 安全说明
 
 - **密钥文件不入 Git**：`.gitignore` 已排除 `*.key` 和 `clients/` 目录，不要手动 `git add` 密钥文件
-- **服务端私钥权限 600**：存储在 `$(brew --prefix)/etc/wireguard/`，只有 root 可读
+- **服务端私钥权限 600**：无论是 NAS 上的 `wg0.conf` 还是 Mac 上 `$(brew --prefix)/etc/wireguard/`，都只应该 root/管理员可读
 - **客户端配置文件权限 600**：生成后妥善保管，泄露等同于泄露私钥
-- **定期轮换密钥**：重新运行 `add-client.sh` 可为同一客户端生成新密钥，旧配置作废
+- **定期轮换密钥**：为设备重新生成一份新密钥即可让旧配置作废
