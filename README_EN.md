@@ -499,6 +499,50 @@ Fixes that were tried and confirmed **ineffective** (they applied cleanly but di
 
 **A side discovery**: If the local DNS service is deployed via Docker with its port mapped to `0.0.0.0:53` (listening on all interfaces), then *any* network interface address on the host — not just its main LAN IP, but also the WireGuard tunnel's own gateway address — can query it directly, with no extra port-forwarding needed.
 
+### Gateway-forwarded traffic to Google / YouTube and other QUIC-heavy sites is slow or won't load
+
+**Symptom**: Surge's own host (Enhanced Mode) loads Google/YouTube quickly, but devices whose traffic is forwarded through Gateway Mode (e.g. a work computer) often hang for a long time on the same sites, sometimes appearing to fail outright. Domestic sites are unaffected.
+
+**Cause**: settings like `udp-policy-not-supported-behaviour = REJECT` in Surge's `[General]` let local traffic fail fast when the selected policy doesn't support UDP forwarding — the browser immediately falls back from QUIC (HTTP/3, over UDP 443) to plain TCP, essentially unnoticeable. Gateway-forwarded traffic doesn't get the same fast-fail treatment — the UDP packets are effectively dropped silently, and the forwarding device is left waiting on its own OS-level UDP timeout (much longer than Surge's own active rejection), which shows up as hanging or intermittent failures.
+
+**Verification**: the local DNS service's (e.g. AdGuard Home) query log will show the forwarding device repeatedly re-querying the same domain in a short window — that's the browser retrying because the connection never actually established, not a DNS problem.
+
+**Fix**: add a global rule at the very top (highest priority) of `[Rule]` to reject QUIC (UDP 443) outright, forcing every device onto TCP so nothing waits on a UDP timeout:
+
+```
+AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT
+```
+
+**Side effect**: this rule is global — it doesn't distinguish domains or domestic vs. international traffic. Regular web browsing is unaffected (silent fallback to TCP), but it will also block real-time communication apps (video calls, some games) that rely on UDP for media transport if they happen to also use port 443 — call quality may degrade or the call may fail to connect. Test your usual video-calling apps after adding this rule.
+
+### A Surge module (.sgmodule) cannot modify `[Proxy]` / `[Proxy Group]`
+
+**The trap**: tried using a module installed locally on only one device (e.g. a phone), not synced with the main profile, to smuggle in a WireGuard exit definition plus its matching proxy and policy-group membership — the goal being "only this device uses this route; other devices sharing the same synced main profile are unaffected." After installing it, testing showed it simply had no effect.
+
+**Cause**: Surge's official docs explicitly state that modules cannot adjust the content of `[Proxy]` or `[Proxy Group]` — neither override nor append is supported. `[WireGuard *]` sections can be modified by a module, but the policy definition (`[Proxy]`) and policy-group membership (`[Proxy Group]`) layers cannot — even if a module contains matching content, it's silently ignored.
+
+**The correct approach**: use Surge's requirement expressions instead, written directly in the main (synced) profile, to give the same key different definitions per platform/device:
+
+```
+[Proxy Group]
+Singapore = fallback, PoolA, SpecificRoute, url=..., interval=120, timeout=3  //!REQUIREMENT SYSTEM=='iOS'
+Singapore = fallback, PoolA, url=..., interval=120, timeout=3  //!REQUIREMENT SYSTEM=='macOS'
+```
+
+Requires Surge iOS 5.11.0+ / Mac 5.7.0+ (the shorthand forms like `#!IOS-ONLY` need newer versions still).
+
+**A gotcha along the way**: requirement expressions take effect per line. If every single line of a section with mandatory fields (e.g. `[WireGuard xxx]`) is tagged with the same condition, then on a platform where the condition doesn't match, the entire section collapses into an empty shell — just the header, no fields at all — which triggers an "Invalid WireGuard config" error. This isn't a parser bug; the empty shell genuinely is invalid (missing required fields like private-key, peer). Only tag the layer that actually needs to differ per platform (e.g. the policy group's member list) with a condition — keep the base definitions (`[WireGuard xxx]`, `[Proxy]`) unconditional so every platform gets the complete definition.
+
+### Legacy iptables (1.8.3) misfiles `-I`/`-A` inserts into the wrong POSTROUTING sub-chain
+
+**Symptom**: on a NAS (Synology or similar Linux box running legacy-mode iptables), running `iptables -t nat -I POSTROUTING <position> ...` to insert a rule into the top-level POSTROUTING chain succeeds with no error — but checking afterward with `iptables -S POSTROUTING` or `-L POSTROUTING` shows the rule landed inside Docker's `DEFAULT_POSTROUTING` sub-chain instead; the top-level chain is untouched and the rule has no effect. Trying to `-D` delete an existing top-level rule that was originally created by a container's PostUp script fails with `No chain/target/match by that name`, even though `-S` shows the rule present with byte-for-byte matching text.
+
+**Cause**: that original rule was created from inside a container (a different iptables build/version than the host's). Even though the rendered text looks identical, the host's own iptables can't match it byte-for-byte at the delete step due to differing internal encoding; and inserting new rules into the top-level chain via `-I` gets mis-filed into a Docker-managed sub-chain by some underlying mechanism.
+
+**Fix**: operate from inside **the same container that created the rule** (`docker exec <container> iptables -t nat ...`) — using the exact same iptables binary, both additions and deletions correctly hit the top-level chain.
+
+**Takeaway**: before touching NAT rules, confirm the rule's real location with a full `iptables -t nat -S` (no chain argument) — querying with an explicit chain name (`-L <chain>` / `-S <chain>`) can be unreliable in this kind of environment.
+
 ---
 
 ## Native Mac deployment (when you don't need Surge/Clash coexistence)

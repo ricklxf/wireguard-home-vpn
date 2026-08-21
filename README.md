@@ -496,6 +496,50 @@ tcpdump -ni <服务端物理网卡> udp port 51820
 
 **顺带发现**：如果本地 DNS 服务是用 Docker 部署、且端口映射是 `0.0.0.0:53`（监听所有网卡），那么宿主机拥有的**任意一个网络接口地址**（不只是主局域网 IP，包括 WireGuard 隧道自己的网关地址）都能直接查到它，不需要额外配置端口转发。
 
+### 网关模式转发流量访问 Google / YouTube 等走 QUIC 的网站很慢或打不开
+
+**现象**：Surge 本机（Enhanced Mode）访问 Google、YouTube 这类网站很快，但网关模式转发进来的设备（如公司电脑）访问同样的网站经常卡很久才打开，甚至看起来像是完全打不开；国内网站不受影响。
+
+**原因**：Surge 的 `[General]` 里 `udp-policy-not-supported-behaviour = REJECT` 这类设置，对本机流量能在"选中的策略不支持 UDP 转发"时立刻快速失败——浏览器马上从 QUIC（HTTP/3，走 UDP 443）降级到普通 TCP，几乎无感知。但网关模式转发流量不会触发同一套快速失败逻辑，UDP 包更像是被静默丢弃，转发设备只能干等自己操作系统级别的 UDP 超时（比 Surge 主动拒绝慢得多），表现为卡顿、间歇性打不开。
+
+**验证**：在本地 DNS 服务（如 AdGuard Home）的查询日志里能看到转发设备在短时间内反复重新查询同一个域名——这是浏览器因为连接一直没建立起来、反复重试导致的，不是 DNS 出了问题。
+
+**修复**：在 `[Rule]` 最顶部（最高优先级）加一条全局规则，直接拦截 QUIC（UDP 443），逼所有设备统一走 TCP，不用等 UDP 超时：
+
+```
+AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT
+```
+
+**副作用**：这条规则全局生效，不区分域名、不区分国内外。对普通网页浏览没有影响（自动降级 TCP，无感知）；但会连带拦掉依赖 UDP 传输媒体流、且恰好也用了 443 端口的实时通信应用（视频通话、部分游戏），可能导致通话质量下降甚至连不上。加规则后建议实测一下常用的视频通话软件。
+
+### Surge 模块（.sgmodule）无法修改 `[Proxy]` / `[Proxy Group]`
+
+**坑**：曾想用一个只在特定设备（如手机）本地安装、不随主配置同步的模块，往里面塞一段 WireGuard 出口定义和对应的策略、策略组成员，实现"只有这台设备用这条线路，其他同步了同一份主配置的设备不受影响"。安装后测试完全不生效。
+
+**原因**：Surge 官方文档明确写明，模块不能调整 `[Proxy]` 和 `[Proxy Group]` 的内容，不管是覆盖还是追加都不支持。`[WireGuard *]` 这类小节模块可以改，但策略定义（`[Proxy]`）和策略组成员列表（`[Proxy Group]`）这两层，模块动不了——即使模块里写了对应内容，也会被静默忽略。
+
+**正确做法**：改用 Surge 的条件表达式（requirement expressions），直接写在主配置文件里（照常走同步），按平台/设备区分同一个 key 的不同定义：
+
+```
+[Proxy Group]
+Singapore = fallback, PoolA, 特定线路, url=..., interval=120, timeout=3  //!REQUIREMENT SYSTEM=='iOS'
+Singapore = fallback, PoolA, url=..., interval=120, timeout=3  //!REQUIREMENT SYSTEM=='macOS'
+```
+
+需要 Surge iOS 5.11.0+ / Mac 5.7.0+（简写版 `#!IOS-ONLY` 等需要更新的版本）。
+
+**踩过的坑**：条件表达式是按"行"生效的，如果把一个必填字段齐全的小节（比如 `[WireGuard xxx]`）里**每一行**都加上同一个条件，条件不满足的平台上，整个小节会变成一个空壳（只剩标题、没有任何字段），触发 "Invalid WireGuard config" 报错——不是解析器 bug，是这个空壳本身就不合法（缺 private-key、peer 等必填字段）。应该只在真正需要按平台区分的那一层（比如策略组的成员列表）加条件，基础定义（`[WireGuard xxx]`、`[Proxy]`）保持无条件、所有平台都拿到完整定义。
+
+### 旧版 iptables（legacy 1.8.3）`-I`/`-A` 插入 POSTROUTING 链时落错子链
+
+**现象**：在 NAS（群晖等 Linux 系统，iptables 走 legacy 模式）上用 `iptables -t nat -I POSTROUTING <位置> ...` 往顶层 POSTROUTING 链插规则，插入命令本身不报错，但事后用 `iptables -S POSTROUTING` 或 `-L POSTROUTING` 查看，规则却出现在了 Docker 管理的 `DEFAULT_POSTROUTING` 子链里，顶层链完全没变化，规则形同虚设。用同样方式尝试 `-D` 删除某条早先由容器 PostUp 脚本创建的顶层规则时，会报 `No chain/target/match by that name`，即使 `-S` 显示这条规则明明存在、文本逐字一致。
+
+**原因**：这条原始规则是容器内部（跟宿主机不同的 iptables 构建/版本）创建的，宿主机上直接用的 iptables 在做精确匹配删除时，即使文本渲染出来一样，底层编码对不上，导致删除失败；用 `-I` 插入新规则到顶层链时，也会被某种机制错误归位到 Docker 管理的子链。
+
+**修复**：改到**创建这条规则的同一个容器内部**去操作（`docker exec <容器名> iptables -t nat ...`），用的是同一份 iptables 二进制，增删都能正确命中顶层链。
+
+**顺带的教训**：改动 NAT 规则前，先用完整的 `iptables -t nat -S`（不带链名参数）确认规则真实落点，`-L <链名>` / `-S <链名>` 带上具体链名查询在这类环境下可能不可靠。
+
 ---
 
 ## Mac 原生部署（无 Surge/Clash 共存需求时）
