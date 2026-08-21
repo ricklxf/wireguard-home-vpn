@@ -507,13 +507,24 @@ Fixes that were tried and confirmed **ineffective** (they applied cleanly but di
 
 **Verification**: the local DNS service's (e.g. AdGuard Home) query log will show the forwarding device repeatedly re-querying the same domain in a short window — that's the browser retrying because the connection never actually established, not a DNS problem.
 
-**Fix**: add a global rule at the very top (highest priority) of `[Rule]` to reject QUIC (UDP 443) outright, forcing every device onto TCP so nothing waits on a UDP timeout:
+**A fix tried first that turned out ineffective for gateway-forwarded traffic**: add a global rule at the very top of `[Rule]` to reject QUIC outright:
 
 ```
 AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT
 ```
 
-**Side effect**: this rule is global — it doesn't distinguish domains or domestic vs. international traffic. Regular web browsing is unaffected (silent fallback to TCP), but it will also block real-time communication apps (video calls, some games) that rely on UDP for media transport if they happen to also use port 443 — call quality may degrade or the call may fail to connect. Test your usual video-calling apps after adding this rule.
+This rule **does work for traffic Surge's own host originates** (redundant with `udp-policy-not-supported-behaviour = REJECT`, which already covers that case — harmless to keep as a belt-and-suspenders measure). It **has no effect on gateway-forwarded traffic** — a packet capture confirmed the forwarding device kept sending UDP 443 traffic exactly as before, unchanged. Same root cause as the Fake-IP issue above: Surge's rule layer simply doesn't treat gateway-forwarded traffic the same as local traffic, so a rule verified to work locally can't be assumed to apply to forwarded traffic too.
+
+**The fix that actually works**: move the interception down to the network layer (the NAS's own `iptables`), which doesn't depend on how Surge's gateway mode handles anything. Because this particular NAS's kernel has no `REJECT` target module available (`Couldn't load target 'REJECT'`), DNAT the traffic to a port nothing is listening on instead — the kernel will automatically send back an "ICMP port unreachable," achieving the same effect as an active rejection (as opposed to a silent DROP, which lets the client know immediately that this path is closed and fall back to TCP right away instead of waiting out a timeout):
+
+```bash
+# Add to wg0.conf's PostUp (with a mirrored -D command in PostDown for cleanup)
+iptables -t nat -A PREROUTING -s 10.13.13.0/24 -p udp --dport 443 -j DNAT --to-destination <NAS's LAN IP>:1
+```
+
+**A gotcha along the way**: adding this rule directly on the host with `iptables -A PREROUTING ...` gets silently misfiled into Docker's `DEFAULT_PREROUTING` sub-chain — the top-level chain is untouched and the rule has no effect (same root cause as the POSTROUTING gotcha described earlier). It has to be run from **inside the same container that created the other NAT rules in `wg0.conf`** (`docker exec <container> iptables -t nat -A PREROUTING ...`) to land correctly in the top-level chain.
+
+**Side effect**: this rule blocks UDP 443 globally by source subnet (`10.13.13.0/24`, the WireGuard client subnet) — it doesn't distinguish domains or domestic vs. international traffic. Regular web browsing is unaffected (silent fallback to TCP), but it will also block real-time communication apps (video calls, some games) that rely on UDP for media transport if they happen to also use port 443 — call quality may degrade or the call may fail to connect. Test your usual video-calling apps after adding this rule.
 
 ### A Surge module (.sgmodule) cannot modify `[Proxy]` / `[Proxy Group]`
 
