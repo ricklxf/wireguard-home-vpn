@@ -481,6 +481,10 @@ tcpdump -ni <server's physical interface> udp port 51820
 
 This is expected. The client's WireGuard service may keep running in the background after "Deactivate," and `PersistentKeepalive = 25` sends a keepalive packet every 25 seconds. Also, the server's port is exposed publicly, so internet scanners will probe it randomly. WireGuard validates keys and drops invalid packets outright — this doesn't affect security.
 
+### A recurring root cause: gateway-mode traffic just isn't treated the same as local traffic
+
+The next two writeups (DNS Fake-IP protection, QUIC hanging) look like two unrelated symptoms on the surface, but **they share the same root cause**: Surge has a whole set of optimizations and protections for traffic it originates itself (Enhanced Mode) — Fake-IP, fast UDP rejection, and so on — but most of these don't apply to traffic arriving through Gateway Mode (forwarded in from other devices via routing). Gateway Mode behaves more like transparent forwarding in Surge — it doesn't inherit the special treatment local traffic gets. **Never assume a Surge config verified working for local traffic also works for forwarded traffic — always test it separately from an actual forwarding device.** Here are the two concrete manifestations of this found so far:
+
 ### A specific site is intermittently unreachable: Surge's gateway-mode traffic doesn't get Fake-IP protection
 
 **Symptom**: The Mac itself (Surge Enhanced Mode) can reach a given site with no issues, but another device (e.g. a phone) whose traffic is forwarded in over WireGuard fails to reach the same site intermittently or persistently. A packet capture shows the DNS resolution returning a wrong/poisoned result.
@@ -500,6 +504,8 @@ Fixes that were tried and confirmed **ineffective** (they applied cleanly but di
 **A side discovery**: If the local DNS service is deployed via Docker with its port mapped to `0.0.0.0:53` (listening on all interfaces), then *any* network interface address on the host — not just its main LAN IP, but also the WireGuard tunnel's own gateway address — can query it directly, with no extra port-forwarding needed.
 
 ### Gateway-forwarded traffic to Google / YouTube and other QUIC-heavy sites is slow or won't load
+
+Another manifestation of the **same root cause** as the DNS Fake-IP issue above — this time it's not DNS resolution, it's UDP handling that treats local and forwarded traffic differently.
 
 **Symptom**: Surge's own host (Enhanced Mode) loads Google/YouTube quickly, but devices whose traffic is forwarded through Gateway Mode (e.g. a work computer) often hang for a long time on the same sites, sometimes appearing to fail outright. Domestic sites are unaffected.
 
