@@ -560,6 +560,25 @@ Requires Surge iOS 5.11.0+ / Mac 5.7.0+ (the shorthand forms like `#!IOS-ONLY` n
 
 **Takeaway**: before touching NAT rules, confirm the rule's real location with a full `iptables -t nat -S` (no chain argument) — querying with an explicit chain name (`-L <chain>` / `-S <chain>`) can be unreliable in this kind of environment.
 
+### A specific device times out querying a self-hosted service on the NAS, even though the server's own log shows it was "handled": policy routing misroutes the NAS's own replies to devices on the same subnet
+
+**Symptom**: a client device (e.g. a work computer) times out querying a local service hosted on the NAS (e.g. AdGuard Home's DNS), consistently taking around ten seconds; the exact behavior varies by domain queried and by client device (some devices are fine, others reproduce the timeout every time); the server's own log shows the query was "processed" in under a millisecond — looking completely healthy; a packet capture on the NAS shows the client's query arriving, but no reply packet ever going back out.
+
+**Cause**: if the NAS has a policy route like `ip rule add from 10.13.13.0/24 lookup 100` set up to divert forwarded traffic from the WireGuard client subnet (say `10.13.13.0/24`) to another machine for processing — this rule matches on "source address falls within this subnet," and the NAS's own WireGuard interface address (say `10.13.13.1`) numerically falls within that same subnet too. When the NAS itself — not forwarding someone else's traffic, but originating its own, e.g. a local service replying to a client's query — needs to send a packet to another device on that same subnet, that packet's source address ALSO matches this rule, and gets misrouted as if it were forwarded client traffic, sent somewhere completely unrelated instead of going straight back out the WireGuard interface. This bug only affects the specific pattern of "the NAS itself originates traffic destined for another device on the same subnet" — it doesn't affect the far more common "client reaches the outside internet" case, so it can go unnoticed for a long time until this particular path happens to get tested directly.
+
+**Verification**:
+```bash
+# Simulate: when the NAS itself (the service's own address) replies to a client device, which route does the kernel actually pick?
+ip route get <client address> from <NAS's own WireGuard interface address>
+```
+If the output shows it going through a policy routing table (e.g. `table 100`) with a gateway pointing at some other device, rather than directly `dev wg0`, that's this bug.
+
+**Fix**: add a higher-priority rule (lower number = higher priority for `ip rule`) that carves the NAS's own originated traffic out of that policy route, letting it use the main routing table normally:
+```bash
+ip rule add from <NAS's own WireGuard interface address> lookup main priority 100
+```
+This must sit ahead of the original policy-routing rule to take effect — remember to add it to the boot-persistence script too, or it won't survive a reboot.
+
 ---
 
 ## Native Mac deployment (when you don't need Surge/Clash coexistence)
