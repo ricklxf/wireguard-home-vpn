@@ -576,6 +576,48 @@ ip rule add from <NAS自己的WireGuard接口地址> lookup main priority 100
 ```
 这条必须排在原来那条策略路由规则前面才会生效，记得同步写进开机持久化脚本，否则重启后失效。
 
+### 链路整体排查：UDP 内核缓冲区偏小导致偶发丢包，qdisc 换成公平队列
+
+跑了一遍全链路排查（NAS 硬件、内核参数、网卡 offload、容器资源限制等），确认大部分配置已经是合理状态（CPU 调速为 `performance`、网卡 TSO/GSO/GRO 开启、conntrack 远未跑满、`wireguard` 容器无 CPU/内存限制），但发现两个真实存在的问题：
+
+**问题一：UDP 层有实打实的接收缓冲区溢出**
+
+```bash
+cat /proc/net/snmp | grep -i udp
+# Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors ...
+# 关键看 RcvbufErrors 这一列，非零就说明真实丢过包
+```
+
+`net.core.rmem_max`/`wmem_max` 默认只有 208KB（Linux 通用默认值，从没针对这台机器调过）。当 WireGuard（51820）或 AdGuard（53）的 UDP socket 遇到突发流量（视频流、多连接并发建立）、应用层读取速度跟不上时，内核缓冲区被打满，包会在被 `wireguard-go`/AdGuard 进程读取之前就被丢弃——这类丢包完全不会体现在网卡收发统计（`ip -s link`）或 WireGuard 自己的握手日志里，只有专门查 `RcvbufErrors` 才能看到，非常隐蔽。
+
+**修复**：
+```bash
+sysctl -w net.core.rmem_max=2500000 net.core.rmem_default=2500000
+sysctl -w net.core.wmem_max=2500000 net.core.wmem_default=2500000
+```
+
+**问题二：eth0 的 qdisc 是 `pfifo_fast`，没有公平调度**
+
+默认的 `pfifo_fast` 只按数据包本身的 TOS 字段分三个优先级桶，同一优先级内完全先进先出，一个持续占满带宽的大流量连接（比如大文件下载）会让同一批次里的其他小包（DNS 查询、TCP 握手）排在后面等，造成"网页突然卡一下"的体感。
+
+**踩的坑**：想按业界推荐换成 `fq_codel`（自带主动队列管理，能同时兼顾公平和低延迟），但这台群晖的内核（`4.4.302`，DSM 老分支）压根没编译 `sch_fq_codel` 模块：
+```bash
+modprobe sch_fq_codel
+# modprobe: FATAL: Module sch_fq_codel not found.
+```
+`/lib/modules/$(uname -r)/kernel/net/sched/` 目录本身都不存在，说明是内核裁剪掉了整个可插拔 qdisc 模块机制，不是没装包能解决的。
+
+**替代方案**：改用内核内置、不需要额外模块的 `sfq`（随机公平队列）——虽然没有 fq_codel 那种基于延迟主动丢包的能力，但至少能让并发连接公平分享带宽，不会被单个大流量连接饿死：
+```bash
+tc qdisc replace dev eth0 root sfq
+```
+
+两条都已经加进 `/usr/local/etc/rc.d/custom-routes.sh` 持久化，开机自动生效。
+
+**没有动的一条：客户端 MTU**
+
+当前客户端配置用的是保守值 `MTU = 1280`，而 wg0 接口实际协商支持 `1420`。理论上调大能略微减少封装开销占比，但这个改动在客户端（iPhone/Windows 的 WireGuard App 配置里），服务端这边动不了，需要自己在客户端上改了之后实测一下稳定性（尤其是手机切到蜂窝网络时，部分运营商的封装开销更大，1420 可能会导致丢包，需要留意）。
+
 ---
 
 ## Mac 原生部署（无 Surge/Clash 共存需求时）

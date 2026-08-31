@@ -579,6 +579,48 @@ ip rule add from <NAS's own WireGuard interface address> lookup main priority 10
 ```
 This must sit ahead of the original policy-routing rule to take effect — remember to add it to the boot-persistence script too, or it won't survive a reboot.
 
+### Whole-chain audit: undersized UDP kernel buffers causing intermittent drops, and a fairer qdisc
+
+Ran a full audit of the chain (NAS hardware, kernel parameters, NIC offload, container resource limits, etc.). Most of it turned out to already be in reasonable shape (CPU governor is `performance`, TSO/GSO/GRO are on, conntrack is nowhere near its limit, the `wireguard` container has no CPU/memory limit) — but two real issues turned up.
+
+**Issue 1: real UDP receive-buffer overflow**
+
+```bash
+cat /proc/net/snmp | grep -i udp
+# Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors ...
+# Watch RcvbufErrors specifically — nonzero means packets were actually dropped
+```
+
+`net.core.rmem_max`/`wmem_max` default to just 208KB (the generic Linux default — never tuned for this box). When WireGuard's (51820) or AdGuard's (53) UDP socket hits a burst (a video stream, several connections opening at once) and the application can't read fast enough, the kernel buffer fills up and packets get dropped before `wireguard-go`/AdGuard ever sees them. None of this shows up in NIC counters (`ip -s link`) or WireGuard's own handshake logs — only `RcvbufErrors` reveals it, which makes it easy to miss entirely.
+
+**Fix**:
+```bash
+sysctl -w net.core.rmem_max=2500000 net.core.rmem_default=2500000
+sysctl -w net.core.wmem_max=2500000 net.core.wmem_default=2500000
+```
+
+**Issue 2: eth0's qdisc is `pfifo_fast`, with no fairness between flows**
+
+The default `pfifo_fast` only sorts packets into three priority bands based on the TOS field; within a band it's strictly FIFO. A single sustained large flow (a big download) can make small packets from other connections (DNS lookups, TCP handshakes) queue up behind it, which shows up as "the page just froze for a second."
+
+**Pitfall hit while fixing this**: the standard recommendation is `fq_codel` (built-in active queue management, fair *and* low-latency), but this Synology's kernel (`4.4.302`, an old DSM branch) simply never compiled the `sch_fq_codel` module in:
+```bash
+modprobe sch_fq_codel
+# modprobe: FATAL: Module sch_fq_codel not found.
+```
+`/lib/modules/$(uname -r)/kernel/net/sched/` doesn't even exist on this box — the whole pluggable-qdisc mechanism was stripped out of the kernel build, not just missing a package.
+
+**Workaround**: use `sfq` (Stochastic Fair Queuing) instead — it's built into the kernel and needs no extra module. It lacks fq_codel's latency-based active dropping, but it does give concurrent connections a fair share of bandwidth so one large flow can't starve the rest:
+```bash
+tc qdisc replace dev eth0 root sfq
+```
+
+Both fixes are now in `/usr/local/etc/rc.d/custom-routes.sh` so they're reapplied automatically on every boot.
+
+**Left untouched: client-side MTU**
+
+The client configs currently use a conservative `MTU = 1280`, while the wg0 interface itself actually negotiates up to `1420`. Bumping it should shave a little encapsulation overhead, but that change lives in the client (the WireGuard app config on the iPhone/Windows side) — nothing to do on the server for this one. Test it after changing it, especially on cellular, where some carriers add enough of their own encapsulation overhead that 1420 could start dropping packets.
+
 ---
 
 ## Native Mac deployment (when you don't need Surge/Clash coexistence)
