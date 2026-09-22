@@ -447,7 +447,9 @@ tcpdump -ni eth0 udp port 51820
 
 ## Troubleshooting
 
-### Handshake keeps failing (Handshake did not complete)
+### Basic connectivity issues
+
+#### Handshake keeps failing (Handshake did not complete)
 
 Check in order:
 
@@ -456,7 +458,7 @@ Check in order:
 3. **Is the public IP / DDNS correct?**: `curl -4 ifconfig.me` to check the current public IP against what the client's `Endpoint` domain resolves to
 4. **Confirm traffic is arriving**: `tcpdump -ni eth0 udp port 51820`, reconnect the client, and check for output — no output at all means the packet got dropped somewhere along the way (a restriction on the client's network, a router rule, etc.); output in only one direction means the server is replying but the client isn't receiving it (a NAT/firewall issue)
 
-### Ping works but web pages won't load
+#### Ping works but web pages won't load
 
 Classic MTU issue. Pings are small (32 bytes); TCP/HTTPS packets are large and exceed WireGuard's effective MTU after encapsulation.
 
@@ -466,11 +468,17 @@ Add this to the client's `[Interface]` section:
 MTU = 1280
 ```
 
-### The server's network also runs Surge/Clash, and handshake packets get intercepted with the reply's source address rewritten to a fake IP
+#### The client still sends traffic to the server after disconnecting the VPN
+
+This is expected. The client's WireGuard service may keep running in the background after "Deactivate," and `PersistentKeepalive = 25` sends a keepalive packet every 25 seconds. Also, the server's port is exposed publicly, so internet scanners will probe it randomly. WireGuard validates keys and drops invalid packets outright — this doesn't affect security.
+
+### Gotchas when the server's network has a proxy tool of its own
+
+#### The server's network also runs Surge/Clash, and handshake packets get intercepted with the reply's source address rewritten to a fake IP
 
 See "Why the server lives on a NAS instead of directly on the Mac" above — if you insist on deploying the WireGuard server on the same machine that runs Surge/Clash, this problem is essentially unfixable at the configuration level. The only reliable solution is to move the server to a Linux device that doesn't run a TUN proxy (a NAS, a Raspberry Pi, etc.) and use `ip rule` for policy routing.
 
-### The server's network gateway is a soft router (OpenWrt-style), and the soft router also does transparent proxying
+#### The server's network gateway is a soft router (OpenWrt-style), and the soft router also does transparent proxying
 
 This is a different category of problem from "the same host itself running a proxy client," and the risk is noticeably lower:
 
@@ -485,15 +493,13 @@ tcpdump -ni <server's physical interface> udp port 51820
 # not a virtual/proxy address rewritten by the soft router
 ```
 
-### The client still sends traffic to the server after disconnecting the VPN
+### Surge gateway-mode gotchas
 
-This is expected. The client's WireGuard service may keep running in the background after "Deactivate," and `PersistentKeepalive = 25` sends a keepalive packet every 25 seconds. Also, the server's port is exposed publicly, so internet scanners will probe it randomly. WireGuard validates keys and drops invalid packets outright — this doesn't affect security.
-
-### A recurring root cause: gateway-mode traffic just isn't treated the same as local traffic
+#### A recurring root cause: gateway-mode traffic just isn't treated the same as local traffic
 
 The next two writeups (DNS Fake-IP protection, QUIC hanging) look like two unrelated symptoms on the surface, but **they share the same root cause**: Surge has a whole set of optimizations and protections for traffic it originates itself (Enhanced Mode) — Fake-IP, fast UDP rejection, and so on — but most of these don't apply to traffic arriving through Gateway Mode (forwarded in from other devices via routing). Gateway Mode behaves more like transparent forwarding in Surge — it doesn't inherit the special treatment local traffic gets. **Never assume a Surge config verified working for local traffic also works for forwarded traffic — always test it separately from an actual forwarding device.** Here are the two concrete manifestations of this found so far:
 
-### A specific site is intermittently unreachable: Surge's gateway-mode traffic doesn't get Fake-IP protection
+#### A specific site is intermittently unreachable: Surge's gateway-mode traffic doesn't get Fake-IP protection
 
 **Symptom**: The Mac itself (Surge Enhanced Mode) can reach a given site with no issues, but another device (e.g. a phone) whose traffic is forwarded in over WireGuard fails to reach the same site intermittently or persistently. A packet capture shows the DNS resolution returning a wrong/poisoned result.
 
@@ -511,7 +517,7 @@ Fixes that were tried and confirmed **ineffective** (they applied cleanly but di
 
 **A side discovery**: If the local DNS service is deployed via Docker with its port mapped to `0.0.0.0:53` (listening on all interfaces), then *any* network interface address on the host — not just its main LAN IP, but also the WireGuard tunnel's own gateway address — can query it directly, with no extra port-forwarding needed.
 
-### Gateway-forwarded traffic to Google / YouTube and other QUIC-heavy sites is slow or won't load
+#### Gateway-forwarded traffic to Google / YouTube and other QUIC-heavy sites is slow or won't load
 
 Another manifestation of the **same root cause** as the DNS Fake-IP issue above — this time it's not DNS resolution, it's UDP handling that treats local and forwarded traffic differently.
 
@@ -540,7 +546,7 @@ iptables -t nat -A PREROUTING -s 10.13.13.0/24 -p udp --dport 443 -j DNAT --to-d
 
 **Side effect**: this rule blocks UDP 443 globally by source subnet (`10.13.13.0/24`, the WireGuard client subnet) — it doesn't distinguish domains or domestic vs. international traffic. Regular web browsing is unaffected (silent fallback to TCP), but it will also block real-time communication apps (video calls, some games) that rely on UDP for media transport if they happen to also use port 443 — call quality may degrade or the call may fail to connect. Test your usual video-calling apps after adding this rule.
 
-### A MITM-based ad-blocking module may secretly carry a per-domain QUIC-block rule
+#### A MITM-based ad-blocking module may secretly carry a per-domain QUIC-block rule
 
 Related to, but distinct from, the gateway-mode QUIC gotcha above — this one came up while troubleshooting choppy video loading in a specific app.
 
@@ -552,7 +558,7 @@ Related to, but distinct from, the gateway-mode QUIC gotcha above — this one c
 
 **Diagnostic tip**: if an app is choppy and you suspect an ad-blocking module, don't just suspect the module's decryption overhead — also check whether it quietly ships a QUIC-block rule for that app's domains. Comparing the same domain's connection log before/after disabling the module (did it use QUIC, did it try UDP first and time out before falling back to TCP) is more reliable than judging "is it choppy" by feel.
 
-### A Surge module (.sgmodule) cannot modify `[Proxy]` / `[Proxy Group]`
+#### A Surge module (.sgmodule) cannot modify `[Proxy]` / `[Proxy Group]`
 
 **The trap**: tried using a module installed locally on only one device (e.g. a phone), not synced with the main profile, to smuggle in a WireGuard exit definition plus its matching proxy and policy-group membership — the goal being "only this device uses this route; other devices sharing the same synced main profile are unaffected." After installing it, testing showed it simply had no effect.
 
@@ -570,7 +576,9 @@ Requires Surge iOS 5.11.0+ / Mac 5.7.0+ (the shorthand forms like `#!IOS-ONLY` n
 
 **A gotcha along the way**: requirement expressions take effect per line. If every single line of a section with mandatory fields (e.g. `[WireGuard xxx]`) is tagged with the same condition, then on a platform where the condition doesn't match, the entire section collapses into an empty shell — just the header, no fields at all — which triggers an "Invalid WireGuard config" error. This isn't a parser bug; the empty shell genuinely is invalid (missing required fields like private-key, peer). Only tag the layer that actually needs to differ per platform (e.g. the policy group's member list) with a condition — keep the base definitions (`[WireGuard xxx]`, `[Proxy]`) unconditional so every platform gets the complete definition.
 
-### Legacy iptables (1.8.3) misfiles `-I`/`-A` inserts into the wrong POSTROUTING sub-chain
+### NAS/container low-level gotchas
+
+#### Legacy iptables (1.8.3) misfiles `-I`/`-A` inserts into the wrong POSTROUTING sub-chain
 
 **Symptom**: on a NAS (Synology or similar Linux box running legacy-mode iptables), running `iptables -t nat -I POSTROUTING <position> ...` to insert a rule into the top-level POSTROUTING chain succeeds with no error — but checking afterward with `iptables -S POSTROUTING` or `-L POSTROUTING` shows the rule landed inside Docker's `DEFAULT_POSTROUTING` sub-chain instead; the top-level chain is untouched and the rule has no effect. Trying to `-D` delete an existing top-level rule that was originally created by a container's PostUp script fails with `No chain/target/match by that name`, even though `-S` shows the rule present with byte-for-byte matching text.
 
@@ -580,7 +588,7 @@ Requires Surge iOS 5.11.0+ / Mac 5.7.0+ (the shorthand forms like `#!IOS-ONLY` n
 
 **Takeaway**: before touching NAT rules, confirm the rule's real location with a full `iptables -t nat -S` (no chain argument) — querying with an explicit chain name (`-L <chain>` / `-S <chain>`) can be unreliable in this kind of environment.
 
-### A specific device times out querying a self-hosted service on the NAS, even though the server's own log shows it was "handled": policy routing misroutes the NAS's own replies to devices on the same subnet
+#### A specific device times out querying a self-hosted service on the NAS, even though the server's own log shows it was "handled": policy routing misroutes the NAS's own replies to devices on the same subnet
 
 **Symptom**: a client device (e.g. a work computer) times out querying a local service hosted on the NAS (e.g. AdGuard Home's DNS), consistently taking around ten seconds; the exact behavior varies by domain queried and by client device (some devices are fine, others reproduce the timeout every time); the server's own log shows the query was "processed" in under a millisecond — looking completely healthy; a packet capture on the NAS shows the client's query arriving, but no reply packet ever going back out.
 
@@ -599,7 +607,7 @@ ip rule add from <NAS's own WireGuard interface address> lookup main priority 10
 ```
 This must sit ahead of the original policy-routing rule to take effect — remember to add it to the boot-persistence script too, or it won't survive a reboot.
 
-### Whole-chain audit: undersized UDP kernel buffers causing intermittent drops, and a fairer qdisc
+#### Whole-chain audit: undersized UDP kernel buffers causing intermittent drops, and a fairer qdisc
 
 Ran a full audit of the chain (NAS hardware, kernel parameters, NIC offload, container resource limits, etc.). Most of it turned out to already be in reasonable shape (CPU governor is `performance`, TSO/GSO/GRO are on, conntrack is nowhere near its limit, the `wireguard` container has no CPU/memory limit) — but two real issues turned up.
 
