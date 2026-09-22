@@ -310,6 +310,14 @@ Fix: bypass DNS entirely and hardcode the real IP in the Windows hosts file (ele
 echo <real IP> <domain> >> C:\Windows\System32\drivers\etc\hosts
 ```
 
+**This only solves half the problem**: the hosts entry only fixes DNS resolution, so Windows gets the correct real IP — but once it has that IP, the "route everything through the tunnel" rule still swallows traffic headed there and sends it the long way through home. The company server sees a connection that didn't originate from the office network and rejects it anyway (same symptom as the fake-IP case, but the root cause has moved). The complete fix also needs **a dedicated route for that real IP, routed straight out the local gateway instead of through the tunnel** (same family of commands as the default route in the Windows split-tunnel script — maintain them together):
+
+```cmd
+route add <real IP> mask 255.255.255.255 <company local gateway> metric 1 IF !PHYS_IF! -p
+```
+
+**A gotcha hit later**: when the company's local network gateway address changed (a desk move, an office network refit), this route's next hop wasn't updated to match, so the route pointed at a next hop that no longer existed and did nothing — producing the exact same symptom as never having added the route in the first place. It's easy to go straight back to suspecting the hosts file got wiped again; it hadn't — the route's gateway had just gone stale. **The destination IP never needs to change, only the gateway field does.**
+
 Also add that IP's subnet to the "manual routing" script above, so it routes locally instead of through the tunnel.
 
 ---
@@ -543,16 +551,6 @@ Related to, but distinct from, the gateway-mode QUIC gotcha above — this one c
 **How this differs from the gateway-mode QUIC gotcha above**: that one is a global catch-all rule for **gateway-mode forwarded traffic** (`AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT`, domain-agnostic, covers every forwarded device). This one is a **MITM module's own, domain-scoped** QUIC-block rule. Both can be present in the same config at once, from different sources with different scopes — easy to conflate during troubleshooting.
 
 **Diagnostic tip**: if an app is choppy and you suspect an ad-blocking module, don't just suspect the module's decryption overhead — also check whether it quietly ships a QUIC-block rule for that app's domains. Comparing the same domain's connection log before/after disabling the module (did it use QUIC, did it try UDP first and time out before falling back to TCP) is more reliable than judging "is it choppy" by feel.
-
-### The gateway in a Windows split-tunnel script's single-IP exclusion route goes stale when the office network changes
-
-**Background**: besides the default-route line, the Windows split-tunnel script (see "Windows client split-tunnel setup" earlier) often has an extra single-IP exclusion route — for example, the IP a company's cloud-printing provider uses, which needs to go straight out the local gateway instead of through the tunnel (checked its IP geolocation once: it's a server hosted on Alibaba Cloud, not the office's own internet egress address — it just happens to be an address the printing setup depends on).
-
-**The gotcha**: seeing a "single public IP routed via the local gateway" line like this, it's tempting to jump to "this must be an exclusion for the WireGuard server's own public IP (`home.ricklxf.top`), to keep the handshake packet from getting swallowed by the tunnel and deadlocking." That assumption sounds reasonable, but shouldn't be treated as settled without checking — in this case the route turned out to be for the cloud-printing provider's address, with nothing to do with the WireGuard server at all. Chasing the wrong theory nearly led to "fixing" a route that was already working correctly.
-
-**The actual, single gotcha**: the company's own local network gateway address changed (a desk move, an office network refit), and the route's next hop (the gateway IP after `IF !PHYS_IF!`) wasn't updated to match — so the route pointed at a next hop that no longer existed and did nothing. **The destination IP itself never needed to change** — only the gateway field did.
-
-**Lesson**: when a script has a route excluding one specific IP, confirm what that IP actually is before acting on it — don't assume its purpose from what the pattern "looks like." The exact same "single public IP, routed locally" shape can serve completely unrelated services; guessing toward the more complicated explanation is an easy way to chase the wrong problem entirely.
 
 ### A Surge module (.sgmodule) cannot modify `[Proxy]` / `[Proxy Group]`
 
