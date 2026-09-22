@@ -532,6 +532,28 @@ iptables -t nat -A PREROUTING -s 10.13.13.0/24 -p udp --dport 443 -j DNAT --to-d
 
 **Side effect**: this rule blocks UDP 443 globally by source subnet (`10.13.13.0/24`, the WireGuard client subnet) — it doesn't distinguish domains or domestic vs. international traffic. Regular web browsing is unaffected (silent fallback to TCP), but it will also block real-time communication apps (video calls, some games) that rely on UDP for media transport if they happen to also use port 443 — call quality may degrade or the call may fail to connect. Test your usual video-calling apps after adding this rule.
 
+### A MITM-based ad-blocking module may secretly carry a per-domain QUIC-block rule
+
+Related to, but distinct from, the gateway-mode QUIC gotcha above — this one came up while troubleshooting choppy video loading in a specific app.
+
+**Symptom**: An app (e.g. Xiaohongshu/RedNote) loads images/video slowly, and you suspect an installed ad-blocking module — but even confirming the module's MITM decryption overhead is real, whether disabling the module actually fixes things right away isn't something to assume; there's another easy-to-miss mechanism at play.
+
+**Mechanism**: MITM can only intercept standard TLS handshakes over TCP — it can't decrypt QUIC, which runs over UDP. If QUIC is left alone, the app will just connect over QUIC directly, bypassing TCP/TLS entirely, and the MITM interception (and the ad-filtering it enables) has no effect. So many MITM-based ad-blocking modules quietly add a **QUIC-block rule scoped to the exact domains they target** (something like `DOMAIN-SUFFIX,<target-domain>,REJECT`, but specifically matching UDP:443), forcing the app onto TCP so the MITM layer can actually do its job.
+
+**How this differs from the gateway-mode QUIC gotcha above**: that one is a global catch-all rule for **gateway-mode forwarded traffic** (`AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT`, domain-agnostic, covers every forwarded device). This one is a **MITM module's own, domain-scoped** QUIC-block rule. Both can be present in the same config at once, from different sources with different scopes — easy to conflate during troubleshooting.
+
+**Diagnostic tip**: if an app is choppy and you suspect an ad-blocking module, don't just suspect the module's decryption overhead — also check whether it quietly ships a QUIC-block rule for that app's domains. Comparing the same domain's connection log before/after disabling the module (did it use QUIC, did it try UDP first and time out before falling back to TCP) is more reliable than judging "is it choppy" by feel.
+
+### The hardcoded WireGuard server IP in the Windows split-tunnel script goes stale
+
+**Background**: besides the default-route line, the Windows split-tunnel script (see "Windows client split-tunnel setup" earlier) has an easy-to-overlook second route — it sends traffic to the WireGuard server's own public IP (whatever `home.ricklxf.top` currently resolves to) straight out the physical NIC, excluded from the tunnel. This route is mandatory: the handshake packet that establishes the tunnel has to leave the machine before the tunnel exists, so if the "route everything through the tunnel" default route also swallows this destination, you get a bootstrapping deadlock — the tunnel needs itself to already be up in order to come up.
+
+**The gotcha**: this route used to have the resolved IP **hardcoded** into the script. Home IP addresses are dynamic; DDNS-GO automatically keeps `home.ricklxf.top` pointed at the current one, but the hardcoded IP in the script doesn't follow along — the domain has already moved to the new address while the script keeps green-lighting the old one, so the new address gets swallowed by the "everything through the tunnel" rule instead, the handshake packet has nowhere to go, and the tunnel simply won't connect. This doesn't surface right away — it works fine for as long as the home public IP stays put, and only breaks the moment the ISP reassigns it.
+
+**A related gotcha**: the company's own local gateway address can also change (a desk move, an office network refit), and the route's next hop (the gateway IP after `IF !PHYS_IF!`) has to be updated to match — otherwise the route points at a next hop that no longer exists and does nothing.
+
+**Fix**: stop hardcoding the IP. Resolve `home.ricklxf.top` dynamically on every run with `nslookup -type=A home.ricklxf.top`, and when the result differs from last time, delete the stale route and add the new one — a small text file in the same folder tracks "the IP we resolved last time" for comparison. **This resolution must happen before the default route is changed** — if it happens after, the DNS query itself can get swallowed by the tunnel too, producing the same deadlock ("can't resolve → can't exclude → tunnel even less likely to connect"). Get the order backwards and the fix doesn't fix anything.
+
 ### A Surge module (.sgmodule) cannot modify `[Proxy]` / `[Proxy Group]`
 
 **The trap**: tried using a module installed locally on only one device (e.g. a phone), not synced with the main profile, to smuggle in a WireGuard exit definition plus its matching proxy and policy-group membership — the goal being "only this device uses this route; other devices sharing the same synced main profile are unaffected." After installing it, testing showed it simply had no effect.
